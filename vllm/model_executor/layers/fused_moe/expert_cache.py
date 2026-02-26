@@ -467,9 +467,13 @@ class ExpertCacheManager:
             return
         # Stacked CPU scratch tensor — views become per-layer scratch maps.
         # Contiguous layout enables single bulk CPU→GPU copy.
-        self._stacked_scratch_cpu = torch.full(
+        # Pin memory for faster CPU→GPU DMA (avoids driver staging).
+        _scratch = torch.full(
             (self.num_layers, self.global_num_experts), -1,
             dtype=torch.int32)
+        self._stacked_scratch_cpu = (
+            _scratch.pin_memory() if torch.cuda.is_available() else _scratch
+        )
         self._scratch_maps: List[torch.Tensor] = [
             self._stacked_scratch_cpu[i]
             for i in range(self.num_layers)
@@ -481,6 +485,8 @@ class ExpertCacheManager:
             't_d2h_us': 0.0,
             't_classify_us': 0.0,
             't_cache_map_us': 0.0,
+            't_cache_map_build_us': 0.0,
+            't_cache_map_upload_us': 0.0,
             't_fetch_us': 0.0,
             't_sync_us': 0.0,
             't_deferred_sync_us': 0.0,
@@ -945,6 +951,7 @@ class ExpertCacheManager:
             self._update_cache_map(i, layer, skip_gpu_upload=True)
             t_cmap_delta = time.monotonic() - t_cmap_start
             self._timing['t_cache_map_us'] += t_cmap_delta * 1e6
+            self._timing['t_cache_map_build_us'] += t_cmap_delta * 1e6
 
         t_classify = time.monotonic() - t_classify_start
         if _nvtx:
@@ -968,11 +975,14 @@ class ExpertCacheManager:
         t_cmap_upload_start = time.monotonic()
         if (hasattr(self, '_stacked_scratch_gpu')
                 and self._stacked_scratch_gpu is not None):
-            # Bulk CPU→GPU (single DMA, ~0.2ms for 48×1024×4B = 192KB)
-            self._stacked_scratch_gpu.copy_(self._stacked_scratch_cpu)
-            # Fast GPU→GPU scatter to each layer (48× ~1us = ~48us)
+            # Bulk CPU→GPU (pinned, non_blocking ~10us for 96KB)
+            self._stacked_scratch_gpu.copy_(
+                self._stacked_scratch_cpu, non_blocking=True)
+            # GPU→GPU scatter to each layer's _cache_map
+            # All on default stream → ordered before graph replay
             for i in active_indices:
-                layers[i]._cache_map.copy_(self._stacked_scratch_gpu[i])
+                layers[i]._cache_map.copy_(
+                    self._stacked_scratch_gpu[i], non_blocking=True)
         else:
             # CPU-only or non-CUDA: direct copy
             for i in active_indices:
@@ -980,6 +990,7 @@ class ExpertCacheManager:
                     self._scratch_maps[i].to(layers[i]._cache_map.device))
         t_cmap_upload = time.monotonic() - t_cmap_upload_start
         self._timing['t_cache_map_us'] += t_cmap_upload * 1e6
+        self._timing['t_cache_map_upload_us'] += t_cmap_upload * 1e6
         if _nvtx:
             _nvtx.range_pop()  # phaseC2
 
@@ -1029,8 +1040,9 @@ class ExpertCacheManager:
         lines = [f"ExpertCache timing (avg over {n} calls):"]
         for key in ['t_pre_step_total_us', 't_gpu_gather_us',
                      't_deferred_sync_us', 't_d2h_us',
-                     't_classify_us', 't_cache_map_us', 't_fetch_us',
-                     't_sync_us']:
+                     't_classify_us', 't_cache_map_us',
+                     't_cache_map_build_us', 't_cache_map_upload_us',
+                     't_fetch_us', 't_sync_us']:
             val = self._timing.get(key, 0.0)
             lines.append(f"  {key}: {val/n:.1f} us/call")
         # DMA bytes instrumentation

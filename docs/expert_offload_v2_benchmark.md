@@ -9,30 +9,45 @@
 - **Per-expert size**: w13=2.097MB + w2=1.049MB = 3.146MB (BF16, TP2-sharded)
 - **vLLM**: v0.15.1, CUDA graph mode (enforce_eager=false)
 
-## Evolution: v5 (staging) → v6 (pinned pool)
+## Evolution: v5 → v6 → v7
 
-### Architecture Change
+### Architecture Changes
 
-| Component | v5 | v6 |
-|-----------|----|----|
-| CPU pool | Pageable memory | **Pinned memory** |
-| DMA path | CPU pageable → pinned staging → GPU | CPU pinned → GPU **(direct)** |
-| Copies per expert | 4 (2× staging + 2× DMA) | **2** (direct DMA only) |
+| Component | v5 (staging) | v6 (pinned pool) | v7 (pinned scratch) |
+|-----------|:---:|:---:|:---:|
+| CPU expert pool | Pageable | **Pinned** | Pinned |
+| DMA path | pageable → staging → GPU | pinned → GPU (direct) | pinned → GPU (direct) |
+| Copies per expert | 4 | **2** | 2 |
+| cache_map scratch | N/A | Pageable CPU | **Pinned CPU** |
+| cache_map upload | Per-layer sync | Bulk sync | **Bulk non_blocking** |
 
 ### Performance Comparison
 
-| Metric | v5 (staging) | v6 (pinned) | Improvement |
-|--------|:---:|:---:|:---:|
-| t_pre_step_total | 12,640 us | **6,399 us** | **-49%** |
-| t_fetch | ~6,500 us | **153 us** | **-98%** |
-| t_classify | ~4,000 us | 2,001 us | -50% |
-| eff_bw | 2.1-2.6 GB/s | **10.2 GB/s** | **4.3×** |
-| t_deferred_sync | 4.2 us | 3.5 us | ~same |
-| TPOT b=1 out=128 | 10.2ms | **7.3ms** | **-28%** |
-| hit_rate | 99.1% | 99.9% | +0.8pp |
+| Metric | v5 (staging) | v6 (pinned) | v7 (pinned scratch) | v5→v7 |
+|--------|:---:|:---:|:---:|:---:|
+| t_pre_step_total | 12,640 us | 6,399 us | **3,528 us** | **-72%** |
+| t_cache_map_upload | N/A | ~3,100 us | **369 us** | — |
+| t_fetch | ~6,500 us | 153 us | **72 us** | **-99%** |
+| t_classify | ~4,000 us | 2,001 us | **1,822 us** | **-54%** |
+| eff_bw | 2.1-2.6 GB/s | 10.2 GB/s | **10.2 GB/s** | **4×** |
+| t_deferred_sync | 4.2 us | 0.7 us | **0.3 us** | ~0 |
+| **TPOT b=1 out=128** | **10.2ms** | **7.3ms** | **7.0ms** | **-31%** |
+| hit_rate | 99.1% | 99.9% | **100.0%** | +0.9pp |
 
-**Note**: eff_bw 10.2 GB/s is still 32% of theoretical PCIe Gen4 (32 GB/s).
-Remaining gap is due to small per-expert copies (3.15MB × ~5 experts = 10 individual DMA calls).
+### v6→v7 Root Cause Analysis
+
+**Problem**: v6 `_stacked_scratch_cpu` was a pageable (non-pinned) tensor.
+`copy_()` from pageable CPU → GPU forces the CUDA driver to:
+1. Allocate a temporary pinned staging buffer
+2. `memcpy` from pageable to staging (CPU)
+3. DMA from staging to GPU
+4. Free the staging buffer
+
+For a 96KB cache_map tensor, this driver overhead dominated: **3,100us for 96KB = 0.03 GB/s**.
+
+**Fix**: `.pin_memory()` on `_stacked_scratch_cpu` + `non_blocking=True` on all copies.
+Result: GPU copies are enqueued instantly (~370us Python loop time), execute on default
+stream, and complete before CUDA graph replay (same-stream ordering guarantee).
 
 ## Comprehensive Benchmark (v6, pinned pool)
 
@@ -76,35 +91,92 @@ Remaining gap is due to small per-expert copies (3.15MB × ~5 experts = 10 indiv
 4. **p95 close to p50**: Tail latency is well-controlled (typically <15% above p50),
    indicating the expert cache provides consistent performance.
 
-## Expert Cache Detailed Timing (v6, steady state)
+## Expert Cache Detailed Timing
 
-| Phase | Time (us/call) | % of total | Description |
-|-------|:-:|:-:|---|
-| t_pre_step_total | 6,399 | 100% | Total pre_step wall-clock |
-| t_gpu_gather (A) | 969 | 15.1% | GPU→GPU routing gather |
-| t_d2h (B) | 364 | 5.7% | Bulk D2H (single sync) |
-| t_classify (C) | 2,001 | 31.3% | CPU hit/miss classification |
-| t_cache_map (C2) | ~300 | 4.7% | Batched cache_map upload |
-| t_fetch | 153 | 2.4% | Async DMA queueing |
-| t_deferred_sync | 3.5 | 0.05% | Previous DMA completion |
-| **unaccounted** | ~2,609 | 40.8% | Python overhead, GIL, etc. |
+### v7 Breakdown (TP0, steady state, avg over 5200+ calls)
 
-**Bottleneck**: t_classify (2ms) + unaccounted overhead (2.6ms) = 72% of pre_step.
-DMA itself is negligible (153us + 3.5us sync).
+| Phase | Time (us) | % of total | Description |
+|-------|:---------:|:----------:|-------------|
+| **t_pre_step_total** | **3,528** | **100%** | Total pre_step wall-clock |
+| t_gpu_gather (A) | 942 | 26.7% | GPU→GPU routing snapshot gather |
+| t_d2h (B) | 366 | 10.4% | Bulk D2H (single stream sync) |
+| t_classify (C) | 1,822 | 51.6% | CPU classification loop (48 layers) |
+| — cache_map_build | 736 | 20.9% | Per-layer cache_map scratch update |
+| — t_fetch | 72 | 2.0% | Async DMA queueing (misses only) |
+| — pure classify | ~1,014 | 28.7% | Hit/miss detection, eviction |
+| t_cache_map_upload (C2) | 369 | 10.5% | Pinned CPU → GPU bulk + scatter |
+| t_deferred_sync | 0.3 | 0.01% | Previous step DMA completion |
 
-## Expert Gating Distribution (Layer 0, 500 steps)
+### v6 Breakdown (for comparison, avg over 20500 calls)
+
+| Phase | v6 time (us) | v7 time (us) | Change |
+|-------|:---:|:---:|:---:|
+| t_pre_step_total | 6,399 | **3,528** | **-45%** |
+| t_gpu_gather (A) | 881 | 942 | +7% |
+| t_d2h (B) | 416 | 366 | -12% |
+| t_classify (C) | 2,001 | 1,822 | -9% |
+| t_cache_map_upload (C2) | **~3,100** | **369** | **-88%** |
+| t_fetch | 153 | 72 | -53% |
+| t_deferred_sync | 0.7 | 0.3 | -57% |
+
+**Key insight**: v6's "unaccounted 40%" was actually `t_cache_map_upload` — the pageable
+scratch → GPU copy was taking 3.1ms for 96KB due to CUDA driver staging overhead.
+After pinning, this dropped to 369us (Python loop overhead only).
+
+### pre_step vs CUDA Graph Overlap
+
+```
+v7 timeline (b=1 steady state):
+         pre_step (3.5ms)    idle (3.5ms)
+├────────────────────────────┼────────────────────────────┤
+│  A  │ B │     C      │ C2 │                            │
+├─────┴───┴────────────┴────┴────────────────────────────┤
+│          CUDA graph replay (~7.0ms)                     │
+├─────────────────────────────────────────────────────────┤
+                          TPOT ≈ 7.0ms
+
+v6 timeline (b=1 steady state):
+         pre_step (6.4ms)
+├─────────────────────────────────────────────────────┤
+│  A  │ B │   C   │         C2 (3.1ms!)              │
+├─────┴───┴───────┴──────────────────────────────────┤
+│          CUDA graph replay (~7.3ms)                 │
+├─────────────────────────────────────────────────────┤
+                          TPOT ≈ 7.3ms
+```
+
+**Result**: pre_step (3.5ms) now finishes well before graph replay (7.0ms),
+making pre_step fully hidden. Further pre_step optimization won't improve TPOT
+at b=1 — the bottleneck is now purely CUDA graph execution.
+
+## Expert Gating Distribution
+
+### Short-term (500 steps, cold start)
 
 | Metric | Value |
 |--------|-------|
 | Entropy | 8.02 / 9.00 bits (89.2% of uniform) |
-| Active experts (>0.1% routing share) | 269 / 512 |
-| Active experts (>1% routing share) | 5 / 512 |
-| Top expert (#474) | 1.56% |
-| Top-5 range | 1.16% – 1.56% |
+| Active experts (>0.1%) | 269 / 512 |
+| Active experts (>1%) | 5 / 512 |
 
-**Interpretation**: Near-uniform routing across 269 active experts means the cache
-needs ~270 slots to avoid misses in steady state. With max_res=400, this provides
-comfortable headroom → 99.9% hit rate.
+### Long-term (20,500 steps, steady state)
+
+| Metric | Value |
+|--------|-------|
+| Entropy | **4.31 / 9.00 bits (47.9% of uniform)** |
+| Active experts (>0.1%) | **21 / 512** |
+| Active experts (>1%) | **11 / 512** |
+| Top expert (#326) | **9.14%** |
+| Top-8 experts combined | **~72.7%** |
+
+**Key finding**: Entropy drops dramatically from 89.2% (cold) to 47.9% (warm).
+At steady state, 11 experts handle >1% each, and the top 8 each receive ~9%.
+This explains the 100% hit rate with max_res=400 — only ~21 experts are actively
+needed, far below the 400 cached slots.
+
+**Implication for contiguous DMA**: Since misses average only 0.2 experts/step
+in steady state, contiguous CPU pool layout would primarily help cold start
+(~500 steps) and burst arrival scenarios. Steady-state benefit is negligible.
 
 ## GPU Memory Profile
 
@@ -120,15 +192,18 @@ full [512,...] tensors → ~91 GiB GPU peak → OOM on 93 GiB H100.
 
 ## Remaining Optimization Opportunities
 
-### 1. Contiguous CPU Pool for Bulk DMA
-Current: per-expert individual pinned tensors (3.15MB each, scattered allocations).
-Proposed: single contiguous pinned buffer per layer `[local_E, ...]`.
-Expected: fewer DMA calls, better PCIe utilization (target: 20+ GB/s).
+### 1. t_classify Vectorization (1.8ms → target <0.5ms)
+Classification iterates 48 layers in Python. Each layer does:
+`topk_cpu.unique()` → set operations → hit/miss detection → cache_map build.
+Potential: batch all 48 layers' topk_ids into a single numpy array,
+vectorize the entire classify phase.
 
-### 2. pre_step Python Overhead (2.6ms unaccounted)
-The ~40% unaccounted time suggests Python/GIL overhead in the hot loop.
-Options: C++ extension for classify phase, or torch.compile on classification.
+### 2. GPU Gather Optimization (0.9ms)
+48 GPU→GPU copies of routing snapshots. Could use a custom CUDA kernel
+to gather all snapshots in a single kernel launch.
 
-### 3. t_classify Optimization (2.0ms)
-Classification iterates over 48 layers × ~10 needed experts.
-Vectorized numpy/torch operations could reduce this.
+### 3. Contiguous CPU Pool for Cold Start DMA
+Current: per-expert individual pinned tensors (3.15MB each, scattered).
+Proposed: `[local_E, ...]` contiguous pinned buffer per layer.
+Impact: only during cold start / cache churn. Negligible at steady state.
+Priority: LOW (99.9%+ hit rate makes this almost irrelevant).
