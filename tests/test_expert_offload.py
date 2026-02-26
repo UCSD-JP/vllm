@@ -1,25 +1,37 @@
 """Unit tests for expert weight offloading PoC.
 
 Tests ExpertPredictor (pure CPU) and ExpertCacheManager (mocked CUDA).
-Run: pytest tests/test_expert_offload.py -v
+Run: pytest tests/test_expert_offload.py -v --noconftest
 """
 import sys
 import os
+import importlib.util
 import pytest
 import torch
 from unittest.mock import MagicMock, patch
 
-# Add vllm to path so imports work from this checkout
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Direct module import to avoid fused_moe/__init__.py cascade (which pulls in
+# layer.py and its heavy dependencies). We only need expert_cache and predictor.
+_vllm_root = os.path.join(os.path.dirname(__file__), "..", "vllm",
+                          "model_executor", "layers", "fused_moe")
 
-from vllm.model_executor.layers.fused_moe.expert_predictor import (
-    ExpertPredictor,
-)
-from vllm.model_executor.layers.fused_moe.expert_cache import (
-    ExpertCacheManager,
-    ExpertOffloadConfig,
-    CacheStats,
-)
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+_pred_mod = _load_module(
+    "expert_predictor",
+    os.path.join(_vllm_root, "expert_predictor.py"))
+_cache_mod = _load_module(
+    "expert_cache",
+    os.path.join(_vllm_root, "expert_cache.py"))
+
+ExpertPredictor = _pred_mod.ExpertPredictor
+ExpertCacheManager = _cache_mod.ExpertCacheManager
+ExpertOffloadConfig = _cache_mod.ExpertOffloadConfig
+CacheStats = _cache_mod.CacheStats
 
 
 # ─── ExpertPredictor Tests ────────────────────────────────────────────
@@ -534,6 +546,509 @@ class TestExpertOffloadConfig:
         assert config.enable is True
         assert config.max_resident_per_layer == 30
         assert config.eviction_policy == "lru"
+
+
+# ─── v2: CUDA-graph-compatible pre_step() Tests ─────────────────────
+
+def _make_mock_layer(global_E=16, local_E=16, max_num_tokens=64, top_k=10):
+    """Create a mock FusedMoE-like layer with v2 persistent buffers."""
+    layer = MagicMock()
+    layer.global_num_experts = global_E
+    layer.top_k = top_k
+
+    # v2 persistent buffers (simulated register_buffer on CPU)
+    layer._cache_map = torch.full((global_E,), -1, dtype=torch.int32)
+    layer._routing_snapshot = torch.zeros(
+        max_num_tokens * top_k, dtype=torch.int32)
+    layer._routing_len = torch.zeros(1, dtype=torch.int32)
+
+    # Expert map (ep_size=1: None means identity)
+    layer._expert_map = None
+
+    return layer
+
+
+class TestPreStep:
+    """Tests for v2 pre_step() predict-and-preload interface."""
+
+    def test_pre_step_first_call_uses_initial_cache(self):
+        """First call (routing_len=0) uses initial cache, no misses."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        result = cache.pre_step([layer])
+
+        assert result['total_misses'] == 0
+        assert cache.current_step == 1
+        assert 'miss_ratio' in result
+        assert 't_pre_step_us' in result
+
+    def test_pre_step_updates_cache_map(self):
+        """pre_step writes correct slot mapping to _cache_map."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        cache.pre_step([layer])
+
+        for gid in range(4):
+            slot = layer._cache_map[gid].item()
+            assert 0 <= slot < 4, f"Expert {gid} should have valid slot"
+        for gid in range(4, 8):
+            assert layer._cache_map[gid].item() == -1
+
+    def test_routing_snapshot_roundtrip(self):
+        """Write routing_snapshot → pre_step reads it → correct needed."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        routing = torch.tensor([0, 1, 2], dtype=torch.int32)
+        layer._routing_snapshot[:3].copy_(routing)
+        layer._routing_len.fill_(3)
+
+        result = cache.pre_step([layer])
+
+        assert result['total_misses'] == 0
+        assert cache.stats.hits == 3
+
+    def test_pre_step_detects_misses(self):
+        """Routing needs expert NOT in cache → miss counted."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        routing = torch.tensor([0, 1, 7], dtype=torch.int32)
+        layer._routing_snapshot[:3].copy_(routing)
+        layer._routing_len.fill_(3)
+
+        result = cache.pre_step([layer])
+
+        assert result['total_misses'] == 1
+        assert cache.stats.misses == 1
+        assert cache.stats.hits == 2
+        assert layer._cache_map[7].item() >= 0
+
+    def test_pre_step_multi_layer(self):
+        """pre_step handles multiple layers independently."""
+        cache = _make_cache(num_layers=2, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 2, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layers = [
+            _make_mock_layer(global_E=8, local_E=8),
+            _make_mock_layer(global_E=8, local_E=8),
+        ]
+        layers[0]._routing_snapshot[:1].copy_(
+            torch.tensor([0], dtype=torch.int32))
+        layers[0]._routing_len.fill_(1)
+        layers[1]._routing_snapshot[:1].copy_(
+            torch.tensor([6], dtype=torch.int32))
+        layers[1]._routing_len.fill_(1)
+
+        result = cache.pre_step(layers)
+        assert result['total_misses'] == 1
+
+    def test_pre_step_with_expert_map(self):
+        """pre_step correctly handles EP expert_map (global→local)."""
+        cache = _make_cache(num_layers=1, local_E=4, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 4, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=4)
+        layer._expert_map = torch.tensor(
+            [0, 1, 2, 3, -1, -1, -1, -1], dtype=torch.int32)
+        routing = torch.tensor([0, 5], dtype=torch.int32)
+        layer._routing_snapshot[:2].copy_(routing)
+        layer._routing_len.fill_(2)
+
+        result = cache.pre_step([layer])
+
+        assert result['total_misses'] == 0
+        assert cache.stats.hits == 1
+        assert layer._cache_map[0].item() >= 0
+        assert layer._cache_map[5].item() == -1
+
+    def test_eager_fallback_on_high_miss_ratio(self):
+        """pre_step returns miss_ratio for proportional fallback."""
+        cache = _make_cache(num_layers=1, local_E=16, global_E=16,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 16, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=16, local_E=16)
+        routing = torch.tensor(list(range(4, 16)), dtype=torch.int32)
+        layer._routing_snapshot[:12].copy_(routing)
+        layer._routing_len.fill_(12)
+
+        result = cache.pre_step([layer])
+
+        assert result['total_misses'] > 0
+        assert result['miss_ratio'] > 0.5  # most experts missed
+
+    def test_cache_map_inplace_preserves_identity(self):
+        """_cache_map.data_ptr() is preserved across pre_step calls."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        ptr_before = layer._cache_map.data_ptr()
+        cache.pre_step([layer])
+        ptr_after = layer._cache_map.data_ptr()
+        assert ptr_before == ptr_after, \
+            "data_ptr must be preserved for CUDA graph compatibility"
+
+    def test_pre_step_skips_layers_without_buffers(self):
+        """Layers without _cache_map are skipped gracefully."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer_no_buffer = MagicMock()
+        layer_no_buffer._cache_map = None
+        result = cache.pre_step([layer_no_buffer])
+        assert result['total_misses'] == 0
+
+    def test_padding_does_not_affect_needed_local(self):
+        """HIGH-1: num_tokens trims padding from routing snapshot."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8, top_k=2)
+        # 2 real tokens × top_k=2 = 4 valid routing entries
+        # Then 2 padding tokens × top_k=2 = 4 padding entries with expert 7
+        real_routing = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        pad_routing = torch.tensor([7, 7, 7, 7], dtype=torch.int32)
+        layer._routing_snapshot[:4].copy_(real_routing)
+        layer._routing_snapshot[4:8].copy_(pad_routing)
+        layer._routing_len.fill_(8)  # graph records padded length
+
+        # Without num_tokens: expert 7 would be needed (from padding)
+        result_no_trim = cache.pre_step([layer], num_tokens=0)
+        cache.current_step -= 1  # reset for next call
+
+        # Reset stats
+        cache.stats.hits = 0
+        cache.stats.misses = 0
+
+        # With num_tokens=2: only first 4 entries (2 tokens × top_k=2)
+        result_trimmed = cache.pre_step([layer], num_tokens=2)
+
+        # Trimmed version should NOT need expert 7 (padding)
+        assert result_trimmed['total_misses'] == 0  # experts 0-3 all cached
+
+    def test_miss_ratio_invariant_to_padding(self):
+        """HIGH-1: miss_ratio with padding trim equals ratio without."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8, top_k=2)
+        # 1 real token needing experts [0, 5]
+        # padding tokens all route to expert 0
+        layer._routing_snapshot[:2].copy_(
+            torch.tensor([0, 5], dtype=torch.int32))
+        layer._routing_snapshot[2:6].copy_(
+            torch.tensor([0, 0, 0, 0], dtype=torch.int32))
+        layer._routing_len.fill_(6)  # padded
+
+        result = cache.pre_step([layer], num_tokens=1)
+        # With trim: only [0, 5] needed. Expert 5 is miss.
+        assert result['total_routed'] == 2
+        assert result['miss_ratio'] == 0.5  # 1 miss / 2 routed
+
+
+# ─── Batched D2H + Vectorized Cache Map Tests ────────────────────────
+
+class TestBatchedD2H:
+    """Tests for batched D2H optimization (Steps 2-4)."""
+
+    def test_set_expert_slot_syncs_tensor(self):
+        """_set_expert_slot updates both list and tensor mirror."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        # Init tensor mirror manually
+        cache._expert_to_slot_t = torch.full(
+            (1, 8), -1, dtype=torch.int32)
+        for eid in range(8):
+            cache._expert_to_slot_t[0, eid] = \
+                cache._expert_to_slot[0][eid]
+
+        # Now call wrapper and verify both are updated
+        cache._set_expert_slot(0, 5, 2)
+        assert cache._expert_to_slot[0][5] == 2
+        assert cache._expert_to_slot_t[0, 5].item() == 2
+
+        # Clear slot
+        cache._set_expert_slot(0, 5, -1)
+        assert cache._expert_to_slot[0][5] == -1
+        assert cache._expert_to_slot_t[0, 5].item() == -1
+
+    def test_vectorized_cache_map_matches_loop(self):
+        """Vectorized _update_cache_map produces same result as loop."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+
+        # Get loop result (before tensor mirror exists)
+        cache._update_cache_map(0, layer)
+        loop_result = layer._cache_map.clone()
+
+        # Now init tensor mirror + emap cache
+        cache._expert_to_slot_t = torch.full(
+            (1, 8), -1, dtype=torch.int32)
+        for eid in range(8):
+            cache._expert_to_slot_t[0, eid] = \
+                cache._expert_to_slot[0][eid]
+        cache._emap_cpu_cache = [None]  # ep_size=1
+
+        # Get vectorized result
+        layer._cache_map.fill_(-1)
+        cache._update_cache_map(0, layer)
+        vec_result = layer._cache_map.clone()
+
+        assert torch.equal(loop_result, vec_result), \
+            f"Mismatch: loop={loop_result} vs vec={vec_result}"
+
+    def test_vectorized_cache_map_with_ep(self):
+        """Vectorized path with expert_map (EP)."""
+        cache = _make_cache(num_layers=1, local_E=4, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 4, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=4)
+        emap = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1],
+                            dtype=torch.int32)
+        layer._expert_map = emap
+
+        # Loop result
+        cache._update_cache_map(0, layer)
+        loop_result = layer._cache_map.clone()
+
+        # Init vectorized path
+        cache._expert_to_slot_t = torch.full(
+            (1, 4), -1, dtype=torch.int32)
+        for eid in range(4):
+            cache._expert_to_slot_t[0, eid] = \
+                cache._expert_to_slot[0][eid]
+        cache._emap_cpu_cache = [emap.clone()]
+
+        layer._cache_map.fill_(-1)
+        cache._update_cache_map(0, layer)
+        vec_result = layer._cache_map.clone()
+
+        assert torch.equal(loop_result, vec_result), \
+            f"Mismatch: loop={loop_result} vs vec={vec_result}"
+
+    def test_batched_d2h_init_creates_buffers(self):
+        """_init_batched_d2h creates all required buffers."""
+        cache = _make_cache(num_layers=2, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 2, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layers = [
+            _make_mock_layer(global_E=8, local_E=8),
+            _make_mock_layer(global_E=8, local_E=8),
+        ]
+
+        with patch("torch.cuda.Stream") as mock_stream, \
+             patch("torch.cuda.Event") as mock_event:
+            mock_stream.return_value = MagicMock()
+            mock_event.return_value = MagicMock()
+            cache._init_batched_d2h(layers)
+
+        assert hasattr(cache, '_batched_d2h_ready')
+        assert hasattr(cache, '_routing_len_gpu')
+        assert hasattr(cache, '_routing_snap_gpu')
+        assert hasattr(cache, '_routing_len_cpu')
+        assert hasattr(cache, '_routing_snap_cpu')
+        assert hasattr(cache, '_emap_cpu_cache')
+        assert hasattr(cache, '_expert_to_slot_t')
+        assert hasattr(cache, '_active_layer_indices')
+
+        assert cache._routing_len_gpu.shape == (2,)
+        assert cache._expert_to_slot_t.shape == (2, 8)
+        assert len(cache._emap_cpu_cache) == 2
+        assert len(cache._active_layer_indices) == 2
+
+    def test_batched_pre_step_same_result(self):
+        """Batched pre_step produces same cache_map as unbatched."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        routing = torch.tensor([0, 1, 2], dtype=torch.int32)
+        layer._routing_snapshot[:3].copy_(routing)
+        layer._routing_len.fill_(3)
+
+        # Patch CUDA operations for CPU-only test
+        with patch("torch.cuda.Stream") as mock_stream, \
+             patch("torch.cuda.Event") as mock_event:
+            mock_stream_inst = MagicMock()
+            mock_stream.return_value = mock_stream_inst
+            mock_event_inst = MagicMock()
+            mock_event.return_value = mock_event_inst
+
+            # Need to mock pin_memory for CPU tensors
+            orig_pin = torch.Tensor.pin_memory
+            torch.Tensor.pin_memory = lambda self: self
+            try:
+                result = cache.pre_step([layer])
+            finally:
+                torch.Tensor.pin_memory = orig_pin
+
+        assert result['total_misses'] == 0
+        assert cache.stats.hits == 3
+
+        # Verify cache_map is correct
+        for gid in range(4):
+            slot = layer._cache_map[gid].item()
+            assert 0 <= slot < 4
+
+    def test_get_timing_summary(self):
+        """get_timing_summary returns formatted string."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        cache.__init_v2_scratch = lambda: None
+        cache._timing = {
+            't_pre_step_total_us': 1000.0,
+            't_gpu_gather_us': 100.0,
+            't_d2h_us': 200.0,
+            't_classify_us': 300.0,
+            't_cache_map_us': 150.0,
+            't_fetch_us': 50.0,
+            't_sync_us': 200.0,
+            'pre_step_calls': 10,
+        }
+        summary = cache.get_timing_summary()
+        assert "avg over 10 calls" in summary
+        assert "t_pre_step_total_us: 100.0 us/call" in summary
+        assert "t_d2h_us: 20.0 us/call" in summary
+
+    def test_invalidate_emap_cache_none(self):
+        """invalidate_emap_cache(None) sets cache entry to None."""
+        cache = _make_cache(num_layers=2, local_E=8, global_E=8,
+                            max_resident=4)
+        cache._emap_cpu_cache = [
+            torch.tensor([0, 1, -1, -1], dtype=torch.int32),
+            None
+        ]
+        cache.invalidate_emap_cache(0)
+        assert cache._emap_cpu_cache[0] is None
+        # Out of range is safe
+        cache.invalidate_emap_cache(99)
+
+    def test_invalidate_emap_cache_recache(self):
+        """invalidate_emap_cache with new_expert_map re-caches immediately."""
+        cache = _make_cache(num_layers=1, local_E=4, global_E=8,
+                            max_resident=4)
+        old_emap = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1],
+                                dtype=torch.int32)
+        cache._emap_cpu_cache = [old_emap.clone()]
+
+        # EPLB changes mapping: experts 4-7 now local, 0-3 remote
+        new_emap = torch.tensor([-1, -1, -1, -1, 0, 1, 2, 3],
+                                dtype=torch.int32)
+        cache.invalidate_emap_cache(0, new_expert_map=new_emap)
+
+        # Cache should have new mapping, not None
+        assert cache._emap_cpu_cache[0] is not None
+        assert torch.equal(cache._emap_cpu_cache[0], new_emap)
+
+    def test_get_timing_summary_before_init(self):
+        """get_timing_summary returns safe message before any pre_step."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        # _timing not yet created (no pre_step called)
+        assert not hasattr(cache, '_timing')
+        summary = cache.get_timing_summary()
+        assert "not yet initialized" in summary
+
+    def test_stacked_scratch_contiguous(self):
+        """scratch_maps are views into contiguous _stacked_scratch_cpu."""
+        cache = _make_cache(num_layers=2, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 2, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        # Trigger __init_v2_scratch
+        cache._ExpertCacheManager__init_v2_scratch()
+
+        # Verify stacked_scratch_cpu exists and scratch_maps are views
+        assert hasattr(cache, '_stacked_scratch_cpu')
+        assert cache._stacked_scratch_cpu.shape == (2, 8)
+        for i in range(2):
+            # Same storage pointer
+            assert (cache._scratch_maps[i].data_ptr()
+                    == cache._stacked_scratch_cpu[i].data_ptr())
+
+        # Write to scratch_maps[0] and verify it's visible in stacked
+        cache._scratch_maps[0].fill_(42)
+        assert cache._stacked_scratch_cpu[0, 0].item() == 42
+        # Scratch maps[1] unchanged
+        assert cache._stacked_scratch_cpu[1, 0].item() == -1
+
+    def test_eplb_invalidation_hook(self):
+        """update_expert_map triggers re-cache with new expert_map."""
+        cache = _make_cache(num_layers=1, local_E=4, global_E=8,
+                            max_resident=4)
+        old_emap = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1],
+                                dtype=torch.int32)
+        cache._emap_cpu_cache = [old_emap.clone()]
+
+        # Simulate what layer.update_expert_map() does:
+        # new_expert_map after EPLB rebalancing
+        new_emap = torch.tensor([0, -1, 2, -1, 1, -1, 3, -1],
+                                dtype=torch.int32)
+        cache.invalidate_emap_cache(0, new_expert_map=new_emap)
+
+        # Cache should have new mapping (not None, not old)
+        assert cache._emap_cpu_cache[0] is not None
+        assert torch.equal(cache._emap_cpu_cache[0], new_emap)
 
 
 if __name__ == "__main__":

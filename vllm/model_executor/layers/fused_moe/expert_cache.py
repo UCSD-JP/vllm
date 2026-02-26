@@ -142,6 +142,16 @@ class ExpertCacheManager:
         self.stats = CacheStats()
         self._lock = threading.Lock()
 
+    def _set_expert_slot(self, layer_idx: int, lid: int, slot: int):
+        """Write to _expert_to_slot + tensor mirror."""
+        self._expert_to_slot[layer_idx][lid] = slot
+        if hasattr(self, '_expert_to_slot_t'):
+            self._expert_to_slot_t[layer_idx, lid] = slot
+
+    def _set_slot_expert(self, layer_idx: int, slot: int, lid: int):
+        """Write to _slot_to_expert."""
+        self._slot_to_expert[layer_idx][slot] = lid
+
     def _resolve_expert_map(
         self, original_expert_map: Optional[torch.Tensor],
     ) -> torch.Tensor:
@@ -200,8 +210,8 @@ class ExpertCacheManager:
         if not self._free_slots[layer_idx]:
             return False
         slot = self._free_slots[layer_idx].pop()
-        self._slot_to_expert[layer_idx][slot] = local_id
-        self._expert_to_slot[layer_idx][local_id] = slot
+        self._set_slot_expert(layer_idx, slot, local_id)
+        self._set_expert_slot(layer_idx, local_id, slot)
 
         w13_cpu, w2_cpu = self._cpu_pool[layer_idx][local_id]
         self._staging_w13[0].copy_(w13_cpu)
@@ -331,8 +341,8 @@ class ExpertCacheManager:
                     break
 
                 slot = self._free_slots[target_layer_idx].pop()
-                self._slot_to_expert[target_layer_idx][slot] = lid
-                self._expert_to_slot[target_layer_idx][lid] = slot
+                self._set_slot_expert(target_layer_idx, slot, lid)
+                self._set_expert_slot(target_layer_idx, lid, slot)
                 self._access_count[(target_layer_idx, lid)] = 0
                 self._last_access[(target_layer_idx, lid)] = self.current_step
 
@@ -380,8 +390,8 @@ class ExpertCacheManager:
                     break
 
             slot = self._free_slots[layer_idx].pop()
-            self._slot_to_expert[layer_idx][slot] = lid
-            self._expert_to_slot[layer_idx][lid] = slot
+            self._set_slot_expert(layer_idx, slot, lid)
+            self._set_expert_slot(layer_idx, lid, slot)
             self._access_count[(layer_idx, lid)] = 1
             self._last_access[(layer_idx, lid)] = self.current_step
             protected.add(lid)  # protect newly loaded expert from eviction
@@ -444,15 +454,525 @@ class ExpertCacheManager:
             return False
 
         lid = self._slot_to_expert[layer_idx][best_slot]
-        self._slot_to_expert[layer_idx][best_slot] = -1
-        self._expert_to_slot[layer_idx][lid] = -1
+        self._set_slot_expert(layer_idx, best_slot, -1)
+        self._set_expert_slot(layer_idx, lid, -1)
         self._free_slots[layer_idx].append(best_slot)
         self.stats.evictions += 1
         return True
 
-    # --- Step ---
+    # --- Step (v1, kept for backward compat) ---
 
     def step(self):
         """Called once per forward step. Resets BW throttle."""
         self.current_step += 1
         self._prefetch_bytes_this_step = 0
+
+    # ================================================================
+    # v2: CUDA-graph-compatible predict-and-preload interface
+    # ================================================================
+
+    def __init_v2_scratch(self):
+        """Lazy-init per-layer scratch maps to avoid repeated allocation."""
+        if hasattr(self, '_scratch_maps'):
+            return
+        # Stacked CPU scratch tensor — views become per-layer scratch maps.
+        # Contiguous layout enables single bulk CPU→GPU copy.
+        self._stacked_scratch_cpu = torch.full(
+            (self.num_layers, self.global_num_experts), -1,
+            dtype=torch.int32)
+        self._scratch_maps: List[torch.Tensor] = [
+            self._stacked_scratch_cpu[i]
+            for i in range(self.num_layers)
+        ]
+        # Timing instrumentation
+        self._timing = {
+            't_pre_step_total_us': 0.0,
+            't_gpu_gather_us': 0.0,
+            't_d2h_us': 0.0,
+            't_classify_us': 0.0,
+            't_cache_map_us': 0.0,
+            't_fetch_us': 0.0,
+            't_sync_us': 0.0,
+            'pre_step_calls': 0,
+            'bytes_fetched_total': 0,
+            'experts_fetched_total': 0,
+        }
+
+    def _init_batched_d2h(self, layers):
+        """Lazy-init batched D2H infrastructure on first pre_step call.
+
+        Creates:
+        - Stacked GPU buffers for GPU→GPU gather
+        - Pinned CPU landing pads for bulk D2H
+        - Expert map CPU cache (avoid repeated .cpu())
+        - _expert_to_slot tensor mirror
+        - Dedicated D2H stream + event
+        """
+        if hasattr(self, '_batched_d2h_ready'):
+            return
+        self._batched_d2h_ready = True
+
+        num_layers = len(layers)
+        # Determine max routing snapshot length across layers
+        max_snap_len = 0
+        for layer in layers:
+            if hasattr(layer, '_routing_snapshot') \
+                    and layer._routing_snapshot is not None:
+                try:
+                    slen = int(layer._routing_snapshot.shape[0])
+                    max_snap_len = max(max_snap_len, slen)
+                except (TypeError, AttributeError):
+                    pass
+        if max_snap_len == 0:
+            max_snap_len = 4096  # fallback
+
+        # Detect device from first layer's buffer
+        dev = self.device
+        for layer in layers:
+            if hasattr(layer, '_routing_len') \
+                    and layer._routing_len is not None:
+                try:
+                    d = layer._routing_len.device
+                    if isinstance(d, torch.device):
+                        dev = d
+                        break
+                except (AttributeError, TypeError):
+                    pass
+        # Normalize: ensure dev is a torch.device
+        if not isinstance(dev, torch.device):
+            dev = torch.device('cpu')
+        self._is_cuda = dev.type == 'cuda'
+
+        # 2a. Stacked GPU buffers (for GPU→GPU gather)
+        self._routing_len_gpu = torch.zeros(
+            num_layers, dtype=torch.int32, device=dev)
+        self._routing_snap_gpu = torch.zeros(
+            num_layers, max_snap_len, dtype=torch.int32, device=dev)
+        self._max_snap_len = max_snap_len
+
+        # 2b. Pinned CPU landing pads (for bulk D2H)
+        self._routing_len_cpu = torch.zeros(
+            num_layers, dtype=torch.int32)
+        self._routing_snap_cpu = torch.zeros(
+            num_layers, max_snap_len, dtype=torch.int32)
+        if self._is_cuda:
+            try:
+                self._routing_len_cpu = self._routing_len_cpu.pin_memory()
+                self._routing_snap_cpu = \
+                    self._routing_snap_cpu.pin_memory()
+            except RuntimeError:
+                pass
+
+        # 2c. Expert map CPU cache
+        self._emap_cpu_cache: List[Optional[torch.Tensor]] = []
+        for layer in layers:
+            if hasattr(layer, '_expert_map') \
+                    and layer._expert_map is not None:
+                emap = layer._expert_map
+                self._emap_cpu_cache.append(
+                    emap.cpu() if emap.device.type != 'cpu' else emap.clone())
+            else:
+                self._emap_cpu_cache.append(None)
+
+        # 2d. _expert_to_slot tensor mirror (CPU, int32)
+        self._expert_to_slot_t = torch.full(
+            (num_layers, self.local_num_experts), -1, dtype=torch.int32)
+        # Copy from Python lists
+        for li in range(min(num_layers, self.num_layers)):
+            for eid in range(self.local_num_experts):
+                self._expert_to_slot_t[li, eid] = \
+                    self._expert_to_slot[li][eid]
+
+        # 2e. Dedicated D2H stream + event
+        if self._is_cuda:
+            try:
+                self._d2h_stream = torch.cuda.Stream(device=dev)
+                self._d2h_event = torch.cuda.Event()
+            except RuntimeError:
+                self._d2h_stream = None
+                self._d2h_event = None
+        else:
+            self._d2h_stream = None
+            self._d2h_event = None
+
+        # Track layer indices for active layers (have _cache_map)
+        self._active_layer_indices: List[int] = []
+        for i, layer in enumerate(layers):
+            if hasattr(layer, '_cache_map') and layer._cache_map is not None:
+                self._active_layer_indices.append(i)
+
+        # 2f. Stacked GPU buffer for batched cache_map upload
+        # Instead of 48× CPU→GPU per layer, do one bulk copy then
+        # 48× fast GPU→GPU scatter.
+        self.__init_v2_scratch()  # ensure _stacked_scratch_cpu exists
+        if self._is_cuda:
+            self._stacked_scratch_gpu = torch.full(
+                (num_layers, self.global_num_experts), -1,
+                dtype=torch.int32, device=dev)
+        else:
+            self._stacked_scratch_gpu = None
+
+    def invalidate_emap_cache(self, layer_idx: int,
+                              new_expert_map: Optional[torch.Tensor] = None):
+        """Re-cache expert_map for a layer after EPLB update.
+
+        Args:
+            layer_idx: Layer index to invalidate.
+            new_expert_map: Updated expert_map tensor. If provided, immediately
+                re-cached (avoids identity fallback which is wrong for EP).
+                If None, the next pre_step will use identity fallback
+                (only safe for ep_size=1).
+        """
+        if not hasattr(self, '_emap_cpu_cache') \
+                or layer_idx >= len(self._emap_cpu_cache):
+            return
+        if new_expert_map is not None:
+            self._emap_cpu_cache[layer_idx] = (
+                new_expert_map.cpu()
+                if new_expert_map.device.type != 'cpu'
+                else new_expert_map.clone())
+        else:
+            self._emap_cpu_cache[layer_idx] = None
+
+    def _globals_to_locals(
+        self,
+        layer_idx: int,
+        global_ids: Set[int],
+        layer=None,
+    ) -> Set[int]:
+        """Convert global expert IDs to local expert IDs.
+
+        For ep_size=1 (expert_map=None): global_id == local_id.
+        For EP: uses layer._expert_map to translate.
+        """
+        if layer is not None and hasattr(layer, '_expert_map') \
+                and layer._expert_map is not None:
+            emap = layer._expert_map
+            emap_cpu = emap.cpu() if emap.device.type != 'cpu' else emap
+            local_ids = set()
+            for gid in global_ids:
+                if 0 <= gid < emap_cpu.shape[0]:
+                    lid = emap_cpu[gid].item()
+                    if lid != -1:
+                        local_ids.add(lid)
+            return local_ids
+        else:
+            # ep_size=1: identity mapping
+            return {gid for gid in global_ids
+                    if 0 <= gid < self.local_num_experts}
+
+    def _async_fetch(
+        self,
+        layer_idx: int,
+        local_ids: List[int],
+        protected: Optional[Set[int]] = None,
+    ):
+        """Async CPU→GPU fetch on copy_stream.
+
+        pre_step() calls copy_stream.synchronize() once after all layers.
+        """
+        protected = set(protected) if protected else set()
+        with torch.cuda.stream(self._copy_stream):
+            for i, lid in enumerate(local_ids):
+                if not self._free_slots[layer_idx]:
+                    if not self._evict_one(layer_idx, protected):
+                        self.stats.sync_fetches += 1  # track skips
+                        continue
+                slot = self._free_slots[layer_idx].pop()
+                self._set_slot_expert(layer_idx, slot, lid)
+                self._set_expert_slot(layer_idx, lid, slot)
+                self._access_count[(layer_idx, lid)] = 1
+                self._last_access[(layer_idx, lid)] = self.current_step
+                protected.add(lid)
+
+                si = i % self.config.staging_window_experts
+                w13_cpu, w2_cpu = self._cpu_pool[layer_idx][lid]
+                self._staging_w13[si].copy_(w13_cpu)
+                self._staging_w2[si].copy_(w2_cpu)
+                self._layer_w13[layer_idx][slot].copy_(
+                    self._staging_w13[si], non_blocking=True)
+                self._layer_w2[layer_idx][slot].copy_(
+                    self._staging_w2[si], non_blocking=True)
+
+                # Track DMA bytes for instrumentation
+                if hasattr(self, '_timing'):
+                    nbytes = (w13_cpu.nbytes + w2_cpu.nbytes)
+                    self._timing['bytes_fetched_total'] += nbytes
+                    self._timing['experts_fetched_total'] += 1
+
+    def _update_cache_map(self, layer_idx: int, layer,
+                          skip_gpu_upload: bool = False):
+        """In-place update layer._cache_map with current slot mapping.
+
+        Vectorized: uses _expert_to_slot_t tensor mirror and _emap_cpu_cache
+        to avoid per-element .item() calls. Falls back to loop if batched
+        D2H not initialized yet.
+
+        Uses .copy_() to preserve data_ptr() for CUDA graph compatibility.
+
+        Args:
+            skip_gpu_upload: If True, only writes CPU scratch map.
+                GPU upload is deferred to batched bulk copy in pre_step().
+        """
+        self.__init_v2_scratch()
+        scratch = self._scratch_maps[layer_idx]
+
+        if hasattr(self, '_expert_to_slot_t'):
+            # Vectorized path (zero .item() calls)
+            e2s = self._expert_to_slot_t[layer_idx]  # [local_E] int32
+
+            emap_cpu = (self._emap_cpu_cache[layer_idx]
+                        if hasattr(self, '_emap_cpu_cache')
+                        and layer_idx < len(self._emap_cpu_cache)
+                        else None)
+
+            if emap_cpu is not None:
+                # EP path: emap[gid] -> lid, e2s[lid] -> slot
+                valid = emap_cpu >= 0               # [global_E] bool
+                lids = emap_cpu.clamp(min=0).long()  # safe index
+                slots = e2s[lids]                    # vectorized gather
+                mask = valid & (slots >= 0)
+                scratch.fill_(-1)
+                scratch[mask] = slots[mask]
+            else:
+                # ep_size=1: global_id == local_id
+                scratch.fill_(-1)
+                local_e = min(self.local_num_experts, scratch.shape[0])
+                valid = e2s[:local_e] >= 0
+                scratch[:local_e] = torch.where(
+                    valid, e2s[:local_e],
+                    torch.tensor(-1, dtype=torch.int32))
+        else:
+            # Fallback: scalar loop (before _init_batched_d2h)
+            scratch.fill_(-1)
+            if hasattr(layer, '_expert_map') \
+                    and layer._expert_map is not None:
+                emap = layer._expert_map
+                emap_cpu = emap.cpu() \
+                    if emap.device.type != 'cpu' else emap
+                for gid in range(emap_cpu.shape[0]):
+                    lid = emap_cpu[gid].item()
+                    if lid != -1:
+                        slot = self._expert_to_slot[layer_idx][lid]
+                        if slot != -1:
+                            scratch[gid] = slot
+            else:
+                for lid in range(self.local_num_experts):
+                    slot = self._expert_to_slot[layer_idx][lid]
+                    if slot != -1:
+                        scratch[lid] = slot
+
+        if not skip_gpu_upload:
+            # In-place copy preserves data_ptr
+            layer._cache_map.copy_(scratch.to(layer._cache_map.device))
+
+    def _globals_to_locals_cached(
+        self,
+        layer_idx: int,
+        global_ids: Set[int],
+    ) -> Set[int]:
+        """CPU-only global→local conversion using cached expert_map."""
+        emap_cpu = self._emap_cpu_cache[layer_idx]
+        if emap_cpu is not None:
+            local_ids = set()
+            for gid in global_ids:
+                if 0 <= gid < emap_cpu.shape[0]:
+                    lid = emap_cpu[gid].item()
+                    if lid != -1:
+                        local_ids.add(lid)
+            return local_ids
+        else:
+            # ep_size=1: identity mapping
+            return {gid for gid in global_ids
+                    if 0 <= gid < self.local_num_experts}
+
+    def pre_step(self, layers, num_tokens: int = 0) -> dict:
+        """v2 entry point: called BEFORE CUDA graph replay.
+
+        Batched D2H optimization: gathers all routing data from all layers
+        into stacked GPU buffers, does a single bulk D2H transfer, then
+        processes everything on CPU without further GPU sync.
+
+        Args:
+            layers: List of FusedMoE layer modules.
+            num_tokens: Actual unpadded token count this step (HIGH-1 fix).
+                Used to compute valid_routing_len = num_tokens * top_k.
+                If 0, falls back to graph-recorded _routing_len.
+
+        Returns:
+            dict with 'total_misses', 'total_routed', 'miss_ratio',
+            and timing fields for instrumentation.
+        """
+        import time
+        t0 = time.monotonic()
+
+        self.__init_v2_scratch()
+        self._init_batched_d2h(layers)
+        self.current_step += 1
+        self._prefetch_bytes_this_step = 0
+        total_misses = 0
+        total_routed = 0
+        needs_sync = False
+
+        # ── Phase A: GPU→GPU gather ──────────────────────────────
+        t_gather_start = time.monotonic()
+        active_indices = self._active_layer_indices
+        for i in active_indices:
+            layer = layers[i]
+            self._routing_len_gpu[i].copy_(layer._routing_len[0])
+            snap_len = min(int(layer._routing_snapshot.shape[0]),
+                           self._max_snap_len)
+            self._routing_snap_gpu[i, :snap_len].copy_(
+                layer._routing_snapshot[:snap_len])
+        t_gather = time.monotonic() - t_gather_start
+
+        # ── Phase B: Bulk D2H (single stream, 1 sync) ───────────
+        t_d2h_start = time.monotonic()
+        if self._d2h_stream is not None:
+            with torch.cuda.stream(self._d2h_stream):
+                self._routing_len_cpu.copy_(
+                    self._routing_len_gpu, non_blocking=True)
+                self._routing_snap_cpu.copy_(
+                    self._routing_snap_gpu, non_blocking=True)
+                self._d2h_event.record(self._d2h_stream)
+            self._d2h_event.synchronize()  # single sync point
+        else:
+            # CPU-only fallback (testing)
+            self._routing_len_cpu.copy_(self._routing_len_gpu)
+            self._routing_snap_cpu.copy_(self._routing_snap_gpu)
+        t_d2h = time.monotonic() - t_d2h_start
+
+        # ── Phase C: CPU-only processing (no GPU sync) ───────────
+        t_classify_start = time.monotonic()
+        for i in active_indices:
+            layer = layers[i]
+
+            # 1. Read routing from CPU landing pad
+            rlen = int(self._routing_len_cpu[i].item())
+            if num_tokens > 0:
+                top_k = getattr(layer, 'top_k', 10)
+                valid_len = num_tokens * top_k
+                rlen = min(rlen, valid_len)
+
+            if rlen > 0:
+                topk_cpu = self._routing_snap_cpu[i, :rlen]
+                needed_global = set(topk_cpu.unique().tolist())
+                needed_local = self._globals_to_locals_cached(
+                    i, needed_global)
+            else:
+                # First step (warmup): use initial cache contents
+                needed_local = set()
+                for lid in range(self.local_num_experts):
+                    if self._expert_to_slot[i][lid] != -1:
+                        needed_local.add(lid)
+
+            total_routed += len(needed_local)
+
+            # 2. Hit/miss classification
+            miss_ids = []
+            for lid in needed_local:
+                key = (i, lid)
+                if self._expert_to_slot[i][lid] != -1:
+                    self._access_count[key] += 1
+                    self._last_access[key] = self.current_step
+                    self.stats.hits += 1
+                else:
+                    miss_ids.append(lid)
+                    self.stats.misses += 1
+
+            total_misses += len(miss_ids)
+
+            # 3. Async-fetch misses
+            t_fetch_start = time.monotonic()
+            if miss_ids:
+                cached_needed = needed_local - set(miss_ids)
+                self._async_fetch(i, miss_ids, protected=cached_needed)
+                needs_sync = True
+            t_fetch_delta = time.monotonic() - t_fetch_start
+            self._timing['t_fetch_us'] += t_fetch_delta * 1e6
+
+            # 4. Update _cache_map CPU scratch (vectorized, no GPU upload)
+            t_cmap_start = time.monotonic()
+            self._update_cache_map(i, layer, skip_gpu_upload=True)
+            t_cmap_delta = time.monotonic() - t_cmap_start
+            self._timing['t_cache_map_us'] += t_cmap_delta * 1e6
+
+        t_classify = time.monotonic() - t_classify_start
+
+        # ── Phase C2: Batched cache_map GPU upload ─────────────────
+        # Single bulk CPU→GPU copy of all 48 scratch maps, then
+        # fast GPU→GPU scatter to each layer._cache_map.
+        t_cmap_upload_start = time.monotonic()
+        if (hasattr(self, '_stacked_scratch_gpu')
+                and self._stacked_scratch_gpu is not None):
+            # Bulk CPU→GPU (single DMA, ~0.2ms for 48×1024×4B = 192KB)
+            self._stacked_scratch_gpu.copy_(self._stacked_scratch_cpu)
+            # Fast GPU→GPU scatter to each layer (48× ~1us = ~48us)
+            for i in active_indices:
+                layers[i]._cache_map.copy_(self._stacked_scratch_gpu[i])
+        else:
+            # CPU-only or non-CUDA: direct copy
+            for i in active_indices:
+                layers[i]._cache_map.copy_(
+                    self._scratch_maps[i].to(layers[i]._cache_map.device))
+        t_cmap_upload = time.monotonic() - t_cmap_upload_start
+        self._timing['t_cache_map_us'] += t_cmap_upload * 1e6
+
+        # ── Phase D: Final sync for async DMA ────────────────────
+        t_sync_start = time.monotonic()
+        if needs_sync:
+            self._copy_stream.synchronize()
+        t_sync = time.monotonic() - t_sync_start
+
+        t_total = time.monotonic() - t0
+
+        # miss_ratio for proportional fallback
+        miss_ratio = (total_misses / total_routed
+                      if total_routed > 0 else 0.0)
+
+        # Timing instrumentation
+        self._timing['t_pre_step_total_us'] += t_total * 1e6
+        self._timing['t_gpu_gather_us'] += t_gather * 1e6
+        self._timing['t_d2h_us'] += t_d2h * 1e6
+        self._timing['t_classify_us'] += t_classify * 1e6
+        self._timing['t_sync_us'] += t_sync * 1e6
+        self._timing['pre_step_calls'] += 1
+
+        return {
+            'total_misses': total_misses,
+            'total_routed': total_routed,
+            'miss_ratio': miss_ratio,
+            't_pre_step_us': t_total * 1e6,
+            't_gpu_gather_us': t_gather * 1e6,
+            't_d2h_us': t_d2h * 1e6,
+            't_classify_us': t_classify * 1e6,
+            't_sync_us': t_sync * 1e6,
+        }
+
+    def get_timing_summary(self) -> str:
+        """Return human-readable timing summary (avg per pre_step call)."""
+        if not hasattr(self, '_timing'):
+            return "ExpertCache timing: not yet initialized (no pre_step calls)"
+        n = max(self._timing.get('pre_step_calls', 0), 1)
+        lines = [f"ExpertCache timing (avg over {n} calls):"]
+        for key in ['t_pre_step_total_us', 't_gpu_gather_us', 't_d2h_us',
+                     't_classify_us', 't_cache_map_us', 't_fetch_us',
+                     't_sync_us']:
+            val = self._timing.get(key, 0.0)
+            lines.append(f"  {key}: {val/n:.1f} us/call")
+        # DMA bytes instrumentation
+        total_bytes = self._timing.get('bytes_fetched_total', 0)
+        total_experts = self._timing.get('experts_fetched_total', 0)
+        bytes_per_step = total_bytes / n
+        experts_per_step = total_experts / n
+        t_fetch_total_s = self._timing.get('t_fetch_us', 0.0) / 1e6
+        eff_gbps = (total_bytes / t_fetch_total_s / 1e9
+                    if t_fetch_total_s > 0 else 0.0)
+        lines.append(
+            f"  dma_bytes/step: {bytes_per_step/1e6:.2f} MB "
+            f"({experts_per_step:.1f} experts/step, "
+            f"eff_bw: {eff_gbps:.1f} GB/s)")
+        lines.append(
+            f"  hit_rate: {self.stats.hit_rate:.3f} "
+            f"(hits={self.stats.hits}, misses={self.stats.misses})")
+        return "\n".join(lines)
