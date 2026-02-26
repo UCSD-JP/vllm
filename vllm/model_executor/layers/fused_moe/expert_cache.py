@@ -4,15 +4,17 @@
 Single implementation path:
 - w13_weight resized to (max_resident, ...)
 - cache_map replaces expert_map temporarily in forward_cuda()
-- CPU pageable backing store + pinned staging window
+- CPU pinned backing store (direct async DMA, no staging)
 """
 
 import torch
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 import logging
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -114,19 +116,11 @@ class ExpertCacheManager:
         self._last_access: Dict[Tuple[int, int], int] = defaultdict(int)
         self._pinned: Set[Tuple[int, int]] = set()
 
-        # CPU pageable backing store
+        # CPU pinned backing store — enables direct async DMA to GPU
+        # without intermediate staging copies (pageable→pinned eliminated)
         self._cpu_pool: List[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = [
             {} for _ in range(num_layers)
         ]
-
-        # Pinned staging window
-        staging_n = config.staging_window_experts
-        self._staging_w13 = torch.empty(
-            (staging_n, *expert_w13_shape), dtype=dtype, device='cpu'
-        ).pin_memory()
-        self._staging_w2 = torch.empty(
-            (staging_n, *expert_w2_shape), dtype=dtype, device='cpu'
-        ).pin_memory()
 
         # GPU weight tensor references (set by register_layer)
         self._layer_w13: Dict[int, torch.Tensor] = {}
@@ -180,17 +174,16 @@ class ExpertCacheManager:
         w2_weight: torch.Tensor,
         is_shared: bool = False,
     ):
-        """Copy expert weight to CPU pageable pool.
+        """Copy expert weight to CPU pinned pool for direct async DMA.
 
-        Optimized: if weights are already on CPU (offload-aware path),
-        clone instead of .cpu() to avoid unnecessary GPU→CPU transfer.
+        Pinned memory enables non_blocking GPU copies without staging.
         """
         if w13_weight.device.type == 'cpu':
-            w13_cpu = w13_weight.detach().clone()
-            w2_cpu = w2_weight.detach().clone()
+            w13_cpu = w13_weight.detach().clone().pin_memory()
+            w2_cpu = w2_weight.detach().clone().pin_memory()
         else:
-            w13_cpu = w13_weight.detach().cpu()
-            w2_cpu = w2_weight.detach().cpu()
+            w13_cpu = w13_weight.detach().cpu().pin_memory()
+            w2_cpu = w2_weight.detach().cpu().pin_memory()
         self._cpu_pool[layer_idx][local_expert_id] = (w13_cpu, w2_cpu)
         if is_shared and self.config.pin_shared_experts:
             self._pinned.add((layer_idx, local_expert_id))
@@ -214,7 +207,7 @@ class ExpertCacheManager:
         torch.cuda.synchronize(self.device)
 
     def _load_to_slot(self, layer_idx: int, local_id: int) -> bool:
-        """CPU -> staging -> GPU slot (synchronous)."""
+        """CPU pinned -> GPU slot (synchronous, no staging)."""
         if not self._free_slots[layer_idx]:
             return False
         slot = self._free_slots[layer_idx].pop()
@@ -222,10 +215,8 @@ class ExpertCacheManager:
         self._set_expert_slot(layer_idx, local_id, slot)
 
         w13_cpu, w2_cpu = self._cpu_pool[layer_idx][local_id]
-        self._staging_w13[0].copy_(w13_cpu)
-        self._staging_w2[0].copy_(w2_cpu)
-        self._layer_w13[layer_idx][slot].copy_(self._staging_w13[0])
-        self._layer_w2[layer_idx][slot].copy_(self._staging_w2[0])
+        self._layer_w13[layer_idx][slot].copy_(w13_cpu)
+        self._layer_w2[layer_idx][slot].copy_(w2_cpu)
         return True
 
     # --- Core: Called from forward_cuda() ---
@@ -327,9 +318,7 @@ class ExpertCacheManager:
         )
         if remaining <= 0:
             return
-        to_fetch = to_fetch[:min(
-            len(to_fetch), remaining, self.config.staging_window_experts
-        )]
+        to_fetch = to_fetch[:min(len(to_fetch), remaining)]
 
         # Make room
         for _ in range(len(to_fetch)):
@@ -345,8 +334,6 @@ class ExpertCacheManager:
             for i, lid in enumerate(to_fetch):
                 if not self._free_slots[target_layer_idx]:
                     break
-                if i >= self.config.staging_window_experts:
-                    break
 
                 slot = self._free_slots[target_layer_idx].pop()
                 self._set_slot_expert(target_layer_idx, slot, lid)
@@ -355,13 +342,11 @@ class ExpertCacheManager:
                 self._last_access[(target_layer_idx, lid)] = self.current_step
 
                 w13_cpu, w2_cpu = self._cpu_pool[target_layer_idx][lid]
-                self._staging_w13[i].copy_(w13_cpu)
-                self._staging_w2[i].copy_(w2_cpu)
                 self._layer_w13[target_layer_idx][slot].copy_(
-                    self._staging_w13[i], non_blocking=True
+                    w13_cpu, non_blocking=True
                 )
                 self._layer_w2[target_layer_idx][slot].copy_(
-                    self._staging_w2[i], non_blocking=True
+                    w2_cpu, non_blocking=True
                 )
                 loaded.add(lid)
 
@@ -404,12 +389,9 @@ class ExpertCacheManager:
             self._last_access[(layer_idx, lid)] = self.current_step
             protected.add(lid)  # protect newly loaded expert from eviction
 
-            si = i % self.config.staging_window_experts
             w13_cpu, w2_cpu = self._cpu_pool[layer_idx][lid]
-            self._staging_w13[si].copy_(w13_cpu)
-            self._staging_w2[si].copy_(w2_cpu)
-            self._layer_w13[layer_idx][slot].copy_(self._staging_w13[si])
-            self._layer_w2[layer_idx][slot].copy_(self._staging_w2[si])
+            self._layer_w13[layer_idx][slot].copy_(w13_cpu)
+            self._layer_w2[layer_idx][slot].copy_(w2_cpu)
 
             self.stats.sync_fetches += 1
 
@@ -506,6 +488,10 @@ class ExpertCacheManager:
             'bytes_fetched_total': 0,
             'experts_fetched_total': 0,
         }
+        # Expert gating distribution: per-expert access counts
+        self._gating_histogram = np.zeros(
+            self.global_num_experts, dtype=np.int64)
+        self._gating_steps = 0
         # Async DMA hiding: deferred sync state
         self._prev_needs_sync = False
         # Per-layer set of slot indices with in-flight DMA.
@@ -700,14 +686,11 @@ class ExpertCacheManager:
                 self._last_access[(layer_idx, lid)] = self.current_step
                 protected.add(lid)
 
-                si = i % self.config.staging_window_experts
                 w13_cpu, w2_cpu = self._cpu_pool[layer_idx][lid]
-                self._staging_w13[si].copy_(w13_cpu)
-                self._staging_w2[si].copy_(w2_cpu)
                 self._layer_w13[layer_idx][slot].copy_(
-                    self._staging_w13[si], non_blocking=True)
+                    w13_cpu, non_blocking=True)
                 self._layer_w2[layer_idx][slot].copy_(
-                    self._staging_w2[si], non_blocking=True)
+                    w2_cpu, non_blocking=True)
 
                 # Track DMA bytes for instrumentation
                 if hasattr(self, '_timing'):
@@ -818,15 +801,17 @@ class ExpertCacheManager:
             dict with 'total_misses', 'total_routed', 'miss_ratio',
             and timing fields for instrumentation.
         """
-        import time
         t0 = time.monotonic()
+        _nvtx = torch.cuda.nvtx if hasattr(torch.cuda, 'nvtx') else None
+        if _nvtx:
+            _nvtx.range_push("expert_cache::pre_step")
 
         self.__init_v2_scratch()
         self._init_batched_d2h(layers)
 
         # ── Phase 0: Deferred sync from previous step ─────────────
-        # Previous step's DMA was overlapping with graph replay.
-        # By now (7.7ms graph replay > 6.5ms DMA), it should be done.
+        if _nvtx:
+            _nvtx.range_push("phase0_deferred_sync")
         t_dsync_start = time.monotonic()
         if self._prev_needs_sync:
             self._copy_stream.synchronize()
@@ -836,6 +821,8 @@ class ExpertCacheManager:
             self._pending_dma_slots.clear()
         t_dsync = time.monotonic() - t_dsync_start
         self._timing['t_deferred_sync_us'] += t_dsync * 1e6
+        if _nvtx:
+            _nvtx.range_pop()  # phase0
 
         self.current_step += 1
         self._prefetch_bytes_this_step = 0
@@ -844,6 +831,8 @@ class ExpertCacheManager:
         needs_sync = False
 
         # ── Phase A: GPU→GPU gather ──────────────────────────────
+        if _nvtx:
+            _nvtx.range_push("phaseA_gpu_gather")
         t_gather_start = time.monotonic()
         active_indices = self._active_layer_indices
         for i in active_indices:
@@ -854,8 +843,12 @@ class ExpertCacheManager:
             self._routing_snap_gpu[i, :snap_len].copy_(
                 layer._routing_snapshot[:snap_len])
         t_gather = time.monotonic() - t_gather_start
+        if _nvtx:
+            _nvtx.range_pop()  # phaseA
 
         # ── Phase B: Bulk D2H (single stream, 1 sync) ───────────
+        if _nvtx:
+            _nvtx.range_push("phaseB_d2h")
         t_d2h_start = time.monotonic()
         if self._d2h_stream is not None:
             with torch.cuda.stream(self._d2h_stream):
@@ -870,8 +863,12 @@ class ExpertCacheManager:
             self._routing_len_cpu.copy_(self._routing_len_gpu)
             self._routing_snap_cpu.copy_(self._routing_snap_gpu)
         t_d2h = time.monotonic() - t_d2h_start
+        if _nvtx:
+            _nvtx.range_pop()  # phaseB
 
         # ── Phase C: CPU-only processing (no GPU sync) ───────────
+        if _nvtx:
+            _nvtx.range_push("phaseC_classify_fetch")
         t_classify_start = time.monotonic()
         for i in active_indices:
             layer = layers[i]
@@ -888,6 +885,15 @@ class ExpertCacheManager:
                 needed_global = set(topk_cpu.unique().tolist())
                 needed_local = self._globals_to_locals_cached(
                     i, needed_global)
+                # Gating distribution: accumulate per-expert counts
+                # Sample first active layer only (O(n) numpy bincount)
+                if i == active_indices[0]:
+                    ids = topk_cpu.numpy().astype(np.int64)
+                    ids = ids[(ids >= 0) & (ids < self.global_num_experts)]
+                    if len(ids) > 0:
+                        self._gating_histogram += np.bincount(
+                            ids, minlength=self.global_num_experts)
+                    self._gating_steps += 1
             else:
                 # First step (warmup): use initial cache contents
                 needed_local = set()
@@ -941,6 +947,8 @@ class ExpertCacheManager:
             self._timing['t_cache_map_us'] += t_cmap_delta * 1e6
 
         t_classify = time.monotonic() - t_classify_start
+        if _nvtx:
+            _nvtx.range_pop()  # phaseC
 
         # ── Phase C1.5: Mask pending DMA slots from cache_map ──────
         # Slots with in-flight DMA have allocated slots but no valid
@@ -955,8 +963,8 @@ class ExpertCacheManager:
                     scratch[scratch == slot] = -1
 
         # ── Phase C2: Batched cache_map GPU upload ─────────────────
-        # Single bulk CPU→GPU copy of all 48 scratch maps, then
-        # fast GPU→GPU scatter to each layer._cache_map.
+        if _nvtx:
+            _nvtx.range_push("phaseC2_cache_map_upload")
         t_cmap_upload_start = time.monotonic()
         if (hasattr(self, '_stacked_scratch_gpu')
                 and self._stacked_scratch_gpu is not None):
@@ -972,6 +980,8 @@ class ExpertCacheManager:
                     self._scratch_maps[i].to(layers[i]._cache_map.device))
         t_cmap_upload = time.monotonic() - t_cmap_upload_start
         self._timing['t_cache_map_us'] += t_cmap_upload * 1e6
+        if _nvtx:
+            _nvtx.range_pop()  # phaseC2
 
         # ── Phase D: Deferred — DMA overlaps with graph replay ────
         # Instead of blocking here, we defer the sync to the start
@@ -985,6 +995,8 @@ class ExpertCacheManager:
         t_sync = time.monotonic() - t_sync_start
 
         t_total = time.monotonic() - t0
+        if _nvtx:
+            _nvtx.range_pop()  # expert_cache::pre_step
 
         # miss_ratio for proportional fallback
         miss_ratio = (total_misses / total_routed
@@ -1036,4 +1048,37 @@ class ExpertCacheManager:
         lines.append(
             f"  hit_rate: {self.stats.hit_rate:.3f} "
             f"(hits={self.stats.hits}, misses={self.stats.misses})")
+        return "\n".join(lines)
+
+    def get_gating_summary(self) -> str:
+        """Return expert gating distribution summary.
+
+        Shows top-20 most routed experts, entropy, and coverage stats.
+        """
+        total = self._gating_histogram.sum()
+        if total == 0:
+            return "Gating: no routing data collected yet"
+        # Normalize to probability
+        probs = self._gating_histogram / total
+        nonzero = probs[probs > 0]
+        entropy = -np.sum(nonzero * np.log2(nonzero))
+        max_entropy = np.log2(self.global_num_experts)
+        # Coverage: how many experts received > 0.1% of routing
+        active_01 = int(np.sum(probs > 0.001))
+        active_1 = int(np.sum(probs > 0.01))
+        # Top-20
+        top_idx = np.argsort(self._gating_histogram)[::-1][:20]
+        lines = [
+            f"Expert gating distribution (layer 0, {self._gating_steps} steps, "
+            f"{int(total)} total routings):",
+            f"  entropy: {entropy:.2f} / {max_entropy:.2f} bits "
+            f"({entropy/max_entropy*100:.1f}% of uniform)",
+            f"  active experts: {active_01} (>0.1%), {active_1} (>1%)",
+            f"  top-20:"
+        ]
+        for rank, idx in enumerate(top_idx):
+            count = self._gating_histogram[idx]
+            pct = count / total * 100
+            lines.append(f"    #{rank+1} expert {idx}: "
+                         f"{int(count)} ({pct:.2f}%)")
         return "\n".join(lines)
