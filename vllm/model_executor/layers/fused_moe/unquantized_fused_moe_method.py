@@ -120,14 +120,39 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        import os
+
         if self.moe.is_act_and_mul:
             w13_up_dim = 2 * intermediate_size_per_partition
         else:
             w13_up_dim = intermediate_size_per_partition
+
+        # Offload-aware mode: compact GPU slots + CPU backing store
+        offload_enabled = (
+            os.environ.get("VLLM_EXPERT_OFFLOAD_ENABLE", "0") == "1"
+        )
+        max_res = int(os.environ.get("VLLM_EXPERT_MAX_RESIDENT", "0"))
+        use_offload_mode = offload_enabled and 0 < max_res < num_experts
+
+        if use_offload_mode:
+            gpu_expert_dim = max_res
+            # CPU backing stores for all experts (weight_loader writes here)
+            # Explicit device='cpu' to avoid vLLM's CUDA device context hijack.
+            # Plain attrs (not register_buffer) to prevent .to(device) migration.
+            layer._w13_cpu_store = torch.zeros(
+                num_experts, w13_up_dim, hidden_size,
+                dtype=params_dtype, device='cpu')
+            layer._w2_cpu_store = torch.zeros(
+                num_experts, hidden_size, intermediate_size_per_partition,
+                dtype=params_dtype, device='cpu')
+            layer._offload_num_experts = num_experts
+        else:
+            gpu_expert_dim = num_experts
+
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                gpu_expert_dim,
                 w13_up_dim,
                 hidden_size,
                 dtype=params_dtype,
@@ -146,7 +171,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
+                gpu_expert_dim,
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,

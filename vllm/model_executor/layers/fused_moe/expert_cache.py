@@ -180,9 +180,17 @@ class ExpertCacheManager:
         w2_weight: torch.Tensor,
         is_shared: bool = False,
     ):
-        """Copy expert weight to CPU pageable pool."""
-        w13_cpu = w13_weight.detach().cpu()
-        w2_cpu = w2_weight.detach().cpu()
+        """Copy expert weight to CPU pageable pool.
+
+        Optimized: if weights are already on CPU (offload-aware path),
+        clone instead of .cpu() to avoid unnecessary GPU→CPU transfer.
+        """
+        if w13_weight.device.type == 'cpu':
+            w13_cpu = w13_weight.detach().clone()
+            w2_cpu = w2_weight.detach().clone()
+        else:
+            w13_cpu = w13_weight.detach().cpu()
+            w2_cpu = w2_weight.detach().cpu()
         self._cpu_pool[layer_idx][local_expert_id] = (w13_cpu, w2_cpu)
         if is_shared and self.config.pin_shared_experts:
             self._pinned.add((layer_idx, local_expert_id))
@@ -493,10 +501,17 @@ class ExpertCacheManager:
             't_cache_map_us': 0.0,
             't_fetch_us': 0.0,
             't_sync_us': 0.0,
+            't_deferred_sync_us': 0.0,
             'pre_step_calls': 0,
             'bytes_fetched_total': 0,
             'experts_fetched_total': 0,
         }
+        # Async DMA hiding: deferred sync state
+        self._prev_needs_sync = False
+        # Per-layer set of slot indices with in-flight DMA.
+        # These slots are allocated but weight data not yet written.
+        # Must be excluded from cache_map until sync completes.
+        self._pending_dma_slots: Dict[int, Set[int]] = {}
 
     def _init_batched_d2h(self, layers):
         """Lazy-init batched D2H infrastructure on first pre_step call.
@@ -808,6 +823,20 @@ class ExpertCacheManager:
 
         self.__init_v2_scratch()
         self._init_batched_d2h(layers)
+
+        # ── Phase 0: Deferred sync from previous step ─────────────
+        # Previous step's DMA was overlapping with graph replay.
+        # By now (7.7ms graph replay > 6.5ms DMA), it should be done.
+        t_dsync_start = time.monotonic()
+        if self._prev_needs_sync:
+            self._copy_stream.synchronize()
+            self._prev_needs_sync = False
+            # Previous pending slots now have valid data — clear them.
+            # Next _update_cache_map will naturally include them.
+            self._pending_dma_slots.clear()
+        t_dsync = time.monotonic() - t_dsync_start
+        self._timing['t_deferred_sync_us'] += t_dsync * 1e6
+
         self.current_step += 1
         self._prefetch_bytes_this_step = 0
         total_misses = 0
@@ -882,12 +911,26 @@ class ExpertCacheManager:
 
             total_misses += len(miss_ids)
 
-            # 3. Async-fetch misses
+            # 3. Async-fetch misses (DMA issued, not synced)
             t_fetch_start = time.monotonic()
             if miss_ids:
                 cached_needed = needed_local - set(miss_ids)
+                # Record slots BEFORE fetch so we know which are pending
+                pre_fetch_slots = set()
+                for lid in miss_ids:
+                    slot = self._expert_to_slot[i][lid]
+                    if slot != -1:
+                        pre_fetch_slots.add(slot)
                 self._async_fetch(i, miss_ids, protected=cached_needed)
                 needs_sync = True
+                # Track NEW slots allocated by _async_fetch (not in pre_fetch)
+                pending = set()
+                for lid in miss_ids:
+                    slot = self._expert_to_slot[i][lid]
+                    if slot != -1 and slot not in pre_fetch_slots:
+                        pending.add(slot)
+                if pending:
+                    self._pending_dma_slots[i] = pending
             t_fetch_delta = time.monotonic() - t_fetch_start
             self._timing['t_fetch_us'] += t_fetch_delta * 1e6
 
@@ -898,6 +941,18 @@ class ExpertCacheManager:
             self._timing['t_cache_map_us'] += t_cmap_delta * 1e6
 
         t_classify = time.monotonic() - t_classify_start
+
+        # ── Phase C1.5: Mask pending DMA slots from cache_map ──────
+        # Slots with in-flight DMA have allocated slots but no valid
+        # weight data yet.  Set cache_map entries pointing to those
+        # slots to -1 so the kernel skips them this step.  Data will
+        # be available after deferred sync at the start of next step.
+        if self._pending_dma_slots:
+            for li, pending_slots in self._pending_dma_slots.items():
+                scratch = self._scratch_maps[li]
+                for slot in pending_slots:
+                    # scratch[gid]==slot means gid maps to this pending slot
+                    scratch[scratch == slot] = -1
 
         # ── Phase C2: Batched cache_map GPU upload ─────────────────
         # Single bulk CPU→GPU copy of all 48 scratch maps, then
@@ -918,10 +973,15 @@ class ExpertCacheManager:
         t_cmap_upload = time.monotonic() - t_cmap_upload_start
         self._timing['t_cache_map_us'] += t_cmap_upload * 1e6
 
-        # ── Phase D: Final sync for async DMA ────────────────────
+        # ── Phase D: Deferred — DMA overlaps with graph replay ────
+        # Instead of blocking here, we defer the sync to the start
+        # of next pre_step().  The copy_stream DMA (~6.5ms) runs
+        # concurrently with graph replay (~7.7ms) on default stream.
+        # Since cache_map excludes pending slots, no data race.
         t_sync_start = time.monotonic()
         if needs_sync:
-            self._copy_stream.synchronize()
+            self._prev_needs_sync = True
+            # No synchronize() here — that's the whole point!
         t_sync = time.monotonic() - t_sync_start
 
         t_total = time.monotonic() - t0
@@ -955,7 +1015,8 @@ class ExpertCacheManager:
             return "ExpertCache timing: not yet initialized (no pre_step calls)"
         n = max(self._timing.get('pre_step_calls', 0), 1)
         lines = [f"ExpertCache timing (avg over {n} calls):"]
-        for key in ['t_pre_step_total_us', 't_gpu_gather_us', 't_d2h_us',
+        for key in ['t_pre_step_total_us', 't_gpu_gather_us',
+                     't_deferred_sync_us', 't_d2h_us',
                      't_classify_us', 't_cache_map_us', 't_fetch_us',
                      't_sync_us']:
             val = self._timing.get(key, 0.0)

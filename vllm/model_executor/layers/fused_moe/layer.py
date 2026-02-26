@@ -1260,7 +1260,27 @@ class FusedMoE(CustomOp):
             final_shape[shard_dim] = final_shape[shard_dim] // self.tp_size
             param.materialize(final_shape, dtype=loaded_weight.dtype)
 
-        expert_data = param.data if full_load else param.data[expert_id]
+        # Offload-aware: redirect weight data to CPU backing store
+        # In offload mode, w13_weight/w2_weight are compact [max_res, ...]
+        # on GPU, but we load into full [num_experts, ...] CPU stores.
+        _offload_redirect = False
+        if (hasattr(self, '_offload_num_experts')
+                and "weight" in weight_name
+                and "scale" not in weight_name
+                and "zero" not in weight_name
+                and "offset" not in weight_name
+                and "g_idx" not in weight_name):
+            if shard_id in ("w1", "w3") and hasattr(self, '_w13_cpu_store'):
+                expert_data = (self._w13_cpu_store if full_load
+                               else self._w13_cpu_store[expert_id])
+                _offload_redirect = True
+            elif shard_id == "w2" and hasattr(self, '_w2_cpu_store'):
+                expert_data = (self._w2_cpu_store if full_load
+                               else self._w2_cpu_store[expert_id])
+                _offload_redirect = True
+
+        if not _offload_redirect:
+            expert_data = param.data if full_load else param.data[expert_id]
 
         # Case input scale: input_scale loading is only supported for fp8
         if "input_scale" in weight_name:

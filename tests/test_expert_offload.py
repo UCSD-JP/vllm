@@ -623,7 +623,12 @@ class TestPreStep:
         assert cache.stats.hits == 3
 
     def test_pre_step_detects_misses(self):
-        """Routing needs expert NOT in cache → miss counted."""
+        """Routing needs expert NOT in cache → miss counted.
+
+        With deferred DMA sync, the newly loaded expert is PENDING
+        during the current step (cache_map=-1).  It becomes visible
+        after the next pre_step() syncs the DMA.
+        """
         cache = _make_cache(num_layers=1, local_E=8, global_E=8,
                             max_resident=4)
         _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
@@ -640,7 +645,15 @@ class TestPreStep:
         assert result['total_misses'] == 1
         assert cache.stats.misses == 1
         assert cache.stats.hits == 2
+        # Expert 7 is PENDING (DMA in-flight) — excluded from cache_map
+        assert layer._cache_map[7].item() == -1
+
+        # Second pre_step: deferred sync completes → expert 7 visible
+        layer._routing_snapshot[:3].copy_(routing)
+        layer._routing_len.fill_(3)
+        result2 = cache.pre_step([layer])
         assert layer._cache_map[7].item() >= 0
+        assert result2['total_misses'] == 0  # now a hit
 
     def test_pre_step_multi_layer(self):
         """pre_step handles multiple layers independently."""
@@ -1049,6 +1062,66 @@ class TestBatchedD2H:
         # Cache should have new mapping (not None, not old)
         assert cache._emap_cpu_cache[0] is not None
         assert torch.equal(cache._emap_cpu_cache[0], new_emap)
+
+
+    def test_deferred_dma_sync_hides_latency(self):
+        """Async DMA hiding: pending slots excluded from cache_map,
+        available after next pre_step deferred sync."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+
+        # Step 1: route to [0,1,2] — all hits (0-3 initially loaded)
+        layer._routing_snapshot[:3].copy_(
+            torch.tensor([0, 1, 2], dtype=torch.int32))
+        layer._routing_len.fill_(3)
+        r1 = cache.pre_step([layer])
+        assert r1['total_misses'] == 0
+
+        # Step 2: route to [0, 5] — expert 5 is a miss
+        layer._routing_snapshot[:2].copy_(
+            torch.tensor([0, 5], dtype=torch.int32))
+        layer._routing_len.fill_(2)
+        r2 = cache.pre_step([layer])
+        assert r2['total_misses'] == 1
+        # Expert 5 is PENDING — DMA in-flight, masked from cache_map
+        assert layer._cache_map[5].item() == -1
+        # _prev_needs_sync should be True (DMA issued)
+        assert cache._prev_needs_sync is True
+        # Pending slots tracked
+        assert 0 in cache._pending_dma_slots  # layer 0 has pending
+
+        # Step 3: deferred sync runs → expert 5 now visible
+        layer._routing_snapshot[:2].copy_(
+            torch.tensor([0, 5], dtype=torch.int32))
+        layer._routing_len.fill_(2)
+        r3 = cache.pre_step([layer])
+        # Expert 5 was synced at start of this pre_step → now a hit
+        assert r3['total_misses'] == 0
+        assert layer._cache_map[5].item() >= 0
+        # Pending cleared after sync
+        assert len(cache._pending_dma_slots) == 0
+
+    def test_deferred_sync_timing_key_exists(self):
+        """get_timing_summary includes t_deferred_sync_us."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        layer._routing_snapshot[:1].copy_(
+            torch.tensor([0], dtype=torch.int32))
+        layer._routing_len.fill_(1)
+        cache.pre_step([layer])
+
+        summary = cache.get_timing_summary()
+        assert "t_deferred_sync_us" in summary
 
 
 if __name__ == "__main__":

@@ -353,57 +353,76 @@ class Worker(WorkerBase):
 
         import gc
 
+        used_offload_aware = False
         for layer_idx, module in enumerate(moe_layers):
-            # 1. Copy all experts to CPU pool (GPU → CPU)
-            for lid in range(local_E):
-                is_shared = (
-                    hasattr(module, 'num_fused_shared_experts')
-                    and lid < module.num_fused_shared_experts
+            if hasattr(module, '_w13_cpu_store'):
+                used_offload_aware = True
+                # ── Offload-aware path: CPU stores already loaded ──
+                # create_weights() allocated compact GPU [max_res, ...] +
+                # CPU [num_experts, ...] stores. weight_loader() wrote
+                # checkpoint data into CPU stores. No GPU→CPU copy needed.
+                for lid in range(local_E):
+                    is_shared = (
+                        hasattr(module, 'num_fused_shared_experts')
+                        and lid < module.num_fused_shared_experts
+                    )
+                    cache.register_expert_cpu(
+                        layer_idx, lid,
+                        module._w13_cpu_store[lid],
+                        module._w2_cpu_store[lid],
+                        is_shared=is_shared,
+                    )
+                # Free CPU stores from module (now owned by cache pool)
+                delattr(module, '_w13_cpu_store')
+                delattr(module, '_w2_cpu_store')
+                if hasattr(module, '_offload_num_experts'):
+                    delattr(module, '_offload_num_experts')
+                # GPU weight is already [max_res, ...] — no resize needed
+            else:
+                # ── Legacy path: full GPU tensor → CPU copy → resize ──
+                for lid in range(local_E):
+                    is_shared = (
+                        hasattr(module, 'num_fused_shared_experts')
+                        and lid < module.num_fused_shared_experts
+                    )
+                    cache.register_expert_cpu(
+                        layer_idx, lid,
+                        module.w13_weight[lid], module.w2_weight[lid],
+                        is_shared=is_shared,
+                    )
+
+                placeholder_w13 = torch.nn.Parameter(
+                    torch.empty(0, dtype=dtype, device='cpu'),
+                    requires_grad=False,
                 )
-                cache.register_expert_cpu(
-                    layer_idx, lid,
-                    module.w13_weight[lid], module.w2_weight[lid],
-                    is_shared=is_shared,
+                placeholder_w2 = torch.nn.Parameter(
+                    torch.empty(0, dtype=dtype, device='cpu'),
+                    requires_grad=False,
                 )
+                replace_parameter(module, "w13_weight", placeholder_w13)
+                replace_parameter(module, "w2_weight", placeholder_w2)
 
-            # 2. Offload-aware memory release: completely destroy old
-            #    full-size (local_E, ...) GPU tensors before allocating
-            #    the smaller (max_res, ...) tensors.
-            #    Key: replace_parameter + del + gc + empty_cache ensures
-            #    PyTorch's caching allocator can reuse the freed blocks.
-            placeholder_w13 = torch.nn.Parameter(
-                torch.empty(0, dtype=dtype, device='cpu'),
-                requires_grad=False,
-            )
-            placeholder_w2 = torch.nn.Parameter(
-                torch.empty(0, dtype=dtype, device='cpu'),
-                requires_grad=False,
-            )
-            replace_parameter(module, "w13_weight", placeholder_w13)
-            replace_parameter(module, "w2_weight", placeholder_w2)
+                gc.collect()
+                torch.cuda.empty_cache()
 
-            # Force Python GC to break any reference cycles holding
-            # the old (512, ...) GPU tensors alive.
-            gc.collect()
-            torch.cuda.empty_cache()
+                new_w13 = torch.nn.Parameter(
+                    torch.empty(
+                        (max_res, *w13_per_expert), dtype=dtype,
+                        device=self.device
+                    ),
+                    requires_grad=False,
+                )
+                new_w2 = torch.nn.Parameter(
+                    torch.empty(
+                        (max_res, *w2_per_expert), dtype=dtype,
+                        device=self.device
+                    ),
+                    requires_grad=False,
+                )
+                replace_parameter(module, "w13_weight", new_w13)
+                replace_parameter(module, "w2_weight", new_w2)
 
-            # 3. Allocate compact (max_res, ...) GPU weight tensors
-            new_w13 = torch.nn.Parameter(
-                torch.empty(
-                    (max_res, *w13_per_expert), dtype=dtype, device=self.device
-                ),
-                requires_grad=False,
-            )
-            new_w2 = torch.nn.Parameter(
-                torch.empty(
-                    (max_res, *w2_per_expert), dtype=dtype, device=self.device
-                ),
-                requires_grad=False,
-            )
-            replace_parameter(module, "w13_weight", new_w13)
-            replace_parameter(module, "w2_weight", new_w2)
-
-            # 4. Register with cache
+            # Common: register layer with cache
             cache.register_layer(
                 layer_idx, module.w13_weight.data, module.w2_weight.data
             )
@@ -446,8 +465,12 @@ class Worker(WorkerBase):
         )
         freed_gb = freed_bytes / (1 << 30)
 
-        # Update model_memory_usage so KV profiling sees freed space
-        if hasattr(self.model_runner, 'model_memory_usage'):
+        # Update model_memory_usage so KV profiling sees freed space.
+        # ONLY for legacy path where GPU tensors were actually resized.
+        # In offload-aware path, GPU was never allocated at full size,
+        # so model_memory_usage already reflects the compact [max_res,...].
+        if not used_offload_aware and hasattr(
+                self.model_runner, 'model_memory_usage'):
             old_usage = self.model_runner.model_memory_usage
             self.model_runner.model_memory_usage = max(
                 0, old_usage - freed_bytes
@@ -459,6 +482,13 @@ class Worker(WorkerBase):
                 old_usage / (1 << 30),
                 self.model_runner.model_memory_usage / (1 << 30),
                 actual_reduction / (1 << 30),
+            )
+        elif used_offload_aware:
+            logger.info(
+                "Offload-aware path: model_memory_usage kept at %.2fGB "
+                "(GPU was never full-sized)",
+                self.model_runner.model_memory_usage / (1 << 30)
+                if hasattr(self.model_runner, 'model_memory_usage') else 0,
             )
 
         logger.info(
