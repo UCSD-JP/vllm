@@ -318,6 +318,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             router_logits=router_logits,
         )
 
+        # Expert cache integration: resolve cache_map and prefetch
+        expert_map = layer.expert_map
+        if hasattr(layer, '_expert_cache') and layer._expert_cache is not None:
+            cache = layer._expert_cache
+            expert_map = cache.prepare_and_get_expert_map(
+                layer._layer_idx, topk_ids, layer._expert_map,
+            )
+            if (
+                hasattr(layer, '_expert_predictor')
+                and layer._expert_predictor is not None
+            ):
+                predictor = layer._expert_predictor
+                target = layer._layer_idx + 1
+                if target < predictor.num_layers:
+                    predicted = predictor.update_and_predict(
+                        layer._layer_idx, topk_ids, layer._expert_map, target,
+                    )
+                    cache.enqueue_prefetch(target, predicted)
+
         result = self.kernel(
             hidden_states=x,
             w1=layer.w13_weight,
@@ -328,7 +347,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             activation=layer.activation,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
+            expert_map=expert_map,
         )
 
         return result

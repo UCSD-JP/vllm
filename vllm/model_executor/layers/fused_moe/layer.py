@@ -646,6 +646,17 @@ class FusedMoE(CustomOp):
         self.batched_hidden_states: torch.Tensor | None = None
         self.batched_router_logits: torch.Tensor | None = None
 
+        # Expert cache (optional, set by Worker via set_expert_cache)
+        self._expert_cache = None
+        self._expert_predictor = None
+        self._layer_idx = -1
+
+    def set_expert_cache(self, cache, predictor, layer_idx):
+        """Called by Worker._init_expert_offloading() to attach cache."""
+        self._expert_cache = cache
+        self._expert_predictor = predictor
+        self._layer_idx = layer_idx
+
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
     # This is called after all weight loading and post-processing, so it

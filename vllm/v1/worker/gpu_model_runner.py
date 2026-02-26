@@ -2902,6 +2902,10 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
+        # Expert cache: reset per-step BW throttle
+        if hasattr(self, '_expert_cache') and self._expert_cache is not None:
+            self._expert_cache.step()
+
         return self.model(
             input_ids=input_ids,
             positions=positions,

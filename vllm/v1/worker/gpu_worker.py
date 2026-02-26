@@ -273,6 +273,147 @@ class Worker(WorkerBase):
         eep_scale_up = os.environ.get("VLLM_ELASTIC_EP_SCALE_UP_LAUNCH") == "1"
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
+        # Expert offloading init (after model loading)
+        self._init_expert_offloading()
+
+    def _init_expert_offloading(self):
+        """Initialize expert weight offloading. Called after load_model()."""
+        from vllm.model_executor.layers.fused_moe.expert_cache import (
+            ExpertCacheManager, ExpertOffloadConfig,
+        )
+        from vllm.model_executor.layers.fused_moe.expert_predictor import (
+            ExpertPredictor,
+        )
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.utils import replace_parameter
+
+        # PoC: hardcoded config. CLI/config.py integration deferred.
+        config = getattr(self.vllm_config, 'expert_offload_config', None)
+        if config is None:
+            if os.environ.get("VLLM_EXPERT_OFFLOAD_ENABLE", "0") != "1":
+                return
+            config = ExpertOffloadConfig(
+                enable=True,
+                max_resident_per_layer=int(
+                    os.environ.get("VLLM_EXPERT_MAX_RESIDENT", "50")
+                ),
+            )
+        if not config.enable:
+            return
+
+        raw_model = self.model_runner.get_model()
+
+        moe_layers = [
+            m for _, m in raw_model.named_modules()
+            if isinstance(m, FusedMoE)
+        ]
+        if not moe_layers:
+            return
+
+        ref = moe_layers[0]
+        local_E = ref.local_num_experts
+        global_E = ref.global_num_experts
+        w13_per_expert = ref.w13_weight.shape[1:]
+        w2_per_expert = ref.w2_weight.shape[1:]
+        dtype = ref.w13_weight.dtype
+
+        # Validate max_resident_per_layer
+        max_res_cfg = config.max_resident_per_layer
+        if max_res_cfg <= 0 or max_res_cfg > local_E:
+            clamped = min(max(max_res_cfg, 1), local_E)
+            logger.warning(
+                "max_resident_per_layer=%d invalid (local_E=%d), "
+                "clamped to %d", max_res_cfg, local_E, clamped,
+            )
+            config.max_resident_per_layer = clamped
+        if config.max_resident_per_layer >= local_E:
+            logger.info(
+                "max_resident_per_layer=%d >= local_E=%d, "
+                "offloading has no effect — skipping.",
+                config.max_resident_per_layer, local_E,
+            )
+            return
+
+        cache = ExpertCacheManager(
+            config=config,
+            num_layers=len(moe_layers),
+            local_num_experts=local_E,
+            global_num_experts=global_E,
+            expert_w13_shape=tuple(w13_per_expert),
+            expert_w2_shape=tuple(w2_per_expert),
+            dtype=dtype,
+            device=self.device,
+        )
+        predictor = ExpertPredictor(
+            num_layers=len(moe_layers),
+            num_local_experts=local_E,
+            top_k=ref.top_k,
+        )
+
+        max_res = config.max_resident_per_layer
+
+        for layer_idx, module in enumerate(moe_layers):
+            for lid in range(local_E):
+                is_shared = (
+                    hasattr(module, 'num_fused_shared_experts')
+                    and lid < module.num_fused_shared_experts
+                )
+                cache.register_expert_cpu(
+                    layer_idx, lid,
+                    module.w13_weight[lid], module.w2_weight[lid],
+                    is_shared=is_shared,
+                )
+
+            new_w13 = torch.nn.Parameter(
+                torch.empty(
+                    (max_res, *w13_per_expert), dtype=dtype,
+                    device=self.device,
+                ),
+                requires_grad=False,
+            )
+            new_w2 = torch.nn.Parameter(
+                torch.empty(
+                    (max_res, *w2_per_expert), dtype=dtype,
+                    device=self.device,
+                ),
+                requires_grad=False,
+            )
+            replace_parameter(module, "w13_weight", new_w13)
+            replace_parameter(module, "w2_weight", new_w2)
+
+            cache.register_layer(
+                layer_idx, module.w13_weight.data, module.w2_weight.data
+            )
+            module.set_expert_cache(cache, predictor, layer_idx)
+
+        cache.populate_initial_cache()
+
+        self.model_runner._expert_cache = cache
+
+        freed_bytes = (
+            (local_E - max_res) * len(moe_layers) * cache.expert_size_bytes
+        )
+        freed_gb = freed_bytes / (1 << 30)
+
+        if hasattr(self.model_runner, 'model_memory_usage'):
+            old_usage = self.model_runner.model_memory_usage
+            self.model_runner.model_memory_usage = max(
+                0, old_usage - freed_bytes
+            )
+            actual_reduction = old_usage - self.model_runner.model_memory_usage
+            logger.info(
+                "model_memory_usage adjusted: %.2fGB -> %.2fGB "
+                "(freed=%.2fGB)",
+                old_usage / (1 << 30),
+                self.model_runner.model_memory_usage / (1 << 30),
+                actual_reduction / (1 << 30),
+            )
+
+        logger.info(
+            "Expert offloading: %d->%d experts/layer, "
+            "%d layers, ~%.1fGB freed",
+            local_E, max_res, len(moe_layers), freed_gb,
+        )
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
