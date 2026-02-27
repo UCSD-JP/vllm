@@ -167,7 +167,27 @@ at b=1 — the bottleneck is now purely CUDA graph execution.
 TPOT의 병목이 pre_step에서 CUDA graph replay로 이동했으므로,
 7ms의 구성을 분석하여 NVLink 등으로 줄일 수 있는지 검토한다.
 
-### Decode Step 구성 요소
+### TPOT 구성 — 합산이 아닌 병렬(overlap)
+
+```
+Step N의 TPOT:
+
+CPU thread:  [sched] [pre_step 3.7ms] [post]       → CPU_total ≈ 4ms
+                     ↓ graph launch
+GPU default: ────────[graph replay: compute+comm ~5ms]──→
+GPU copy_st: ────────────[DMA 0.3ms]──→ (miss expert fetch, if any)
+                                              ↓ sync
+                                     ←─ TPOT ≈ 7ms ─→
+
+TPOT = max(CPU_total, GPU_graph) + sync_overhead
+     = max(4ms, 5ms) + ~2ms overhead
+     ≈ 7ms
+```
+
+CPU와 GPU는 **병렬 실행**. TPOT는 합산이 아니라 둘 중 긴 쪽이 결정.
+Expert DMA (copy_stream)는 둘 다와 병렬이므로 TPOT에 영향 0.
+
+### GPU Graph 내부 구성
 
 Nsight 프로파일링 데이터 (Paladin TP2-FP16, agentic) 기반:
 
@@ -179,9 +199,24 @@ Nsight 프로파일링 데이터 (Paladin TP2-FP16, agentic) 기반:
 | Attention | ~12% | ~5% | Flash attention 커널 |
 | H2D copy / host prep | ~8% | ~5% | 스케줄러→GPU 데이터 전달 |
 | GPU launch gaps | ~5% | ~2% | 커널 간 idle (CUDA graph에서 최소화) |
-| Python iteration | ~6% | ~3% | vLLM V1 scheduler 1회 iteration |
 
 **핵심**: c=1에서 comm 비중 ~25%, c≥8에서 **52%로 급증**. 고 concurrency에서 comm이 지배.
+
+### Miss Expert Copy 시간
+
+| 항목 | 시간 | 실행 위치 | TPOT 영향 |
+|------|:---:|:---:|:---:|
+| t_fetch (DMA 큐잉) | 78 us/step avg | CPU (pre_step 내) | **0** — pre_step이 graph에 숨겨짐 |
+| 실제 DMA 전송 | ~312 us/expert | GPU copy_stream | **0** — graph replay와 병렬 |
+| t_deferred_sync | 0.4 us/step | CPU (다음 step 시작) | **0** — DMA가 graph 중 이미 완료 |
+
+Miss expert copy는 **3중 overlap** 구조:
+1. DMA 큐잉(78us)은 pre_step 내에서 발생 → pre_step이 graph에 숨겨짐
+2. 실제 DMA(312us/expert)는 copy_stream → default stream의 graph(7ms)와 병렬
+3. 다음 step에서 확인 시(0.4us) 이미 완료
+
+TPOT에 영향을 주려면 한 step에서 **~20+ experts miss** 필요 (312us × 20 = 6.2ms > graph 5ms).
+실측 miss = 0.2 experts/step이므로 해당 없음.
 
 ### AllReduce 데이터량 (TP2, per decode token)
 
@@ -199,32 +234,32 @@ NVLink effective BW = 133 GB/s (H200 NV18 full mesh, `scale=3.59`).
 
 | Component | H100 PCIe (Paladin) | H200 NVLink | 변화 |
 |-----------|:---:|:---:|:---:|
-| Compute (GEMM+ATTN+MoE) | ~2.5-3.5ms | ~2.0-2.5ms | -30% (HBM 4800 vs 3350 GB/s) |
-| AllReduce (b=1) | ~1.7ms | ~0.1ms | **-94%** |
-| CPU iteration overhead | ~3.1ms | ~3.1ms | 0% (Python, 불변) |
-| Launch gaps + H2D | ~0.5ms | ~0.5ms | ~0% |
-| **Total (c=1)** | **~7.0ms** | **~5-6ms** | **-15~29%** |
+| Compute (GEMM+ATTN+MoE) | ~3.5ms | ~2.5ms | -30% (HBM 4800 vs 3350 GB/s) |
+| AllReduce (b=1) | ~1.3ms | ~0.05ms | **-96%** |
+| GPU graph total | ~5ms | ~3ms | -40% |
+| CPU iteration (parallel) | ~4ms | ~4ms | 0% (Python, 불변) |
+| **TPOT = max(CPU, GPU) + sync** | **~7ms** | **~5-6ms** | **-15~29%** |
 
 **실측 비교**: Cloud H200 4×NVLink TP2에서 Qwen3-Next agentic c=1 TPOT = **7-8ms**.
 예측(5-6ms)보다 높은 이유:
-1. **CPU iteration overhead가 지배적** — NVLink이 comm을 줄여도 Python 3.1ms는 그대로
+1. GPU graph가 3ms로 줄어도 **CPU 4ms가 critical path**가 됨
 2. H200 cloud 인스턴스의 NUMA/scheduler 차이
-3. Expert offload 미적용 (cloud 벤치는 non-offload TP2)
+3. Expert offload 미적용 (cloud 벤치는 non-offload TP2, 다른 코드 경로)
 
 ### NVLink으로 줄일 수 있는 부분 vs 없는 부분
 
 **줄일 수 있는 것 (NVLink 효과)**:
-- TP AllReduce 시간: PCIe 1.7ms → NVLink 0.1ms (b=1), 2.5ms → 0.15ms (b=64)
+- TP AllReduce 시간: PCIe 1.3ms → NVLink 0.05ms (b=1)
+- GPU graph: ~5ms → ~3ms
 - 특히 c≥8에서 효과 큼 (comm 비중 52% → ~5%)
-- c=32 burst: 10.6ms → ~8ms 예상 (comm 감소분)
 
 **줄일 수 없는 것**:
-- CPU iteration overhead (3.1ms) — Python/PyTorch scheduling, GIL. 하드웨어 무관
-- Compute 커널 시간 — GPU compute throughput에 의존 (H100→H200 +20% 정도)
-- Expert offload pre_step — 이미 graph replay 안에 숨겨져 있으므로 TPOT 무관
+- CPU iteration overhead (~4ms) — Python/PyTorch scheduling, GIL. 하드웨어 무관
+- NVLink으로 GPU graph를 CPU보다 빠르게 만들면, **CPU가 새로운 병목**이 됨
+- Expert offload pre_step — 이미 graph 안에 숨겨져 있으므로 TPOT 무관
 
-**결론**: NVLink은 c=1에서 ~1.5ms (20%), c=32에서 ~2-3ms (20-25%) 개선 가능.
-하지만 **CPU iteration overhead 3.1ms가 hard floor** — TPOT는 3.1ms 이하로 내릴 수 없음.
+**결론**: NVLink은 GPU graph를 5ms→3ms로 줄이지만, CPU가 ~4ms이므로
+**TPOT는 max(4ms, 3ms) + sync ≈ 5-6ms**. CPU 4ms가 새로운 hard floor.
 이를 넘으려면 C++ custom scheduler나 torch.compile 기반 graph-only execution 필요.
 
 ## Expert Gating Distribution
