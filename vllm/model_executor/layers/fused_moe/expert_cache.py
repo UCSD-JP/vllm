@@ -39,11 +39,19 @@ class CacheStats:
     prefetch_hits: int = 0
     sync_fetches: int = 0
     deduped_prefetches: int = 0
+    # Token-weighted counters (each routing entry, not unique IDs)
+    token_hits: int = 0
+    token_misses: int = 0
 
     @property
     def hit_rate(self) -> float:
         total = self.hits + self.misses
         return self.hits / total if total > 0 else 0.0
+
+    @property
+    def token_hit_rate(self) -> float:
+        total = self.token_hits + self.token_misses
+        return self.token_hits / total if total > 0 else 0.0
 
 
 class ExpertCacheManager:
@@ -494,6 +502,18 @@ class ExpertCacheManager:
             'bytes_fetched_total': 0,
             'experts_fetched_total': 0,
         }
+        # Miss-rate diagnostic counters (per-layer detail, periodic dump)
+        self._diag = {
+            'per_layer_unique_needed': np.zeros(self.num_layers, dtype=np.int64),
+            'per_layer_rlen': np.zeros(self.num_layers, dtype=np.int64),
+            'per_layer_valid_len': np.zeros(self.num_layers, dtype=np.int64),
+            'per_layer_hits': np.zeros(self.num_layers, dtype=np.int64),
+            'per_layer_misses': np.zeros(self.num_layers, dtype=np.int64),
+            'per_layer_token_hits': np.zeros(self.num_layers, dtype=np.int64),
+            'per_layer_token_misses': np.zeros(self.num_layers, dtype=np.int64),
+            'diag_steps': 0,
+            'diag_dump_interval': 100,  # log every N steps
+        }
         # Expert gating distribution: per-expert access counts
         self._gating_histogram = np.zeros(
             self.global_num_experts, dtype=np.int64)
@@ -880,7 +900,9 @@ class ExpertCacheManager:
             layer = layers[i]
 
             # 1. Read routing from CPU landing pad
-            rlen = int(self._routing_len_cpu[i].item())
+            raw_rlen = int(self._routing_len_cpu[i].item())
+            rlen = raw_rlen
+            valid_len = raw_rlen  # track for diagnostics
             if num_tokens > 0:
                 top_k = getattr(layer, 'top_k', 10)
                 valid_len = num_tokens * top_k
@@ -901,6 +923,7 @@ class ExpertCacheManager:
                             ids, minlength=self.global_num_experts)
                     self._gating_steps += 1
             else:
+                topk_cpu = None
                 # First step (warmup): use initial cache contents
                 needed_local = set()
                 for lid in range(self.local_num_experts):
@@ -909,7 +932,7 @@ class ExpertCacheManager:
 
             total_routed += len(needed_local)
 
-            # 2. Hit/miss classification
+            # 2. Hit/miss classification (unique-ID based)
             miss_ids = []
             for lid in needed_local:
                 key = (i, lid)
@@ -922,6 +945,48 @@ class ExpertCacheManager:
                     self.stats.misses += 1
 
             total_misses += len(miss_ids)
+
+            # 2b. Token-weighted hit/miss (each routing entry counted)
+            if topk_cpu is not None and rlen > 0:
+                miss_set = set(miss_ids)
+                # Count per-token routing entries that hit vs miss
+                # Convert global→local for each routing entry
+                emap_cpu = (self._emap_cpu_cache[i]
+                            if hasattr(self, '_emap_cpu_cache')
+                            and i < len(self._emap_cpu_cache)
+                            else None)
+                tk_hit = 0
+                tk_miss = 0
+                for gid_t in topk_cpu.tolist():
+                    gid = int(gid_t)
+                    if emap_cpu is not None:
+                        if 0 <= gid < emap_cpu.shape[0]:
+                            lid = int(emap_cpu[gid].item())
+                        else:
+                            lid = -1
+                    else:
+                        lid = gid if 0 <= gid < self.local_num_experts else -1
+                    if lid == -1:
+                        continue
+                    if lid in miss_set:
+                        tk_miss += 1
+                    else:
+                        tk_hit += 1
+                self.stats.token_hits += tk_hit
+                self.stats.token_misses += tk_miss
+
+            # 2c. Per-layer diagnostics accumulation
+            if hasattr(self, '_diag'):
+                li = min(i, self.num_layers - 1)
+                self._diag['per_layer_rlen'][li] += raw_rlen
+                self._diag['per_layer_valid_len'][li] += valid_len
+                self._diag['per_layer_unique_needed'][li] += len(needed_local)
+                self._diag['per_layer_hits'][li] += (
+                    len(needed_local) - len(miss_ids))
+                self._diag['per_layer_misses'][li] += len(miss_ids)
+                if topk_cpu is not None and rlen > 0:
+                    self._diag['per_layer_token_hits'][li] += tk_hit
+                    self._diag['per_layer_token_misses'][li] += tk_miss
 
             # 3. Async-fetch misses (DMA issued, not synced)
             t_fetch_start = time.monotonic()
@@ -1021,6 +1086,13 @@ class ExpertCacheManager:
         self._timing['t_sync_us'] += t_sync * 1e6
         self._timing['pre_step_calls'] += 1
 
+        # Periodic miss-rate diagnostic dump
+        if hasattr(self, '_diag'):
+            self._diag['diag_steps'] += 1
+            interval = self._diag['diag_dump_interval']
+            if self._diag['diag_steps'] % interval == 0:
+                logger.info(self.get_miss_diagnostics())
+
         return {
             'total_misses': total_misses,
             'total_routed': total_routed,
@@ -1058,8 +1130,12 @@ class ExpertCacheManager:
             f"({experts_per_step:.1f} experts/step, "
             f"eff_bw: {eff_gbps:.1f} GB/s)")
         lines.append(
-            f"  hit_rate: {self.stats.hit_rate:.3f} "
+            f"  hit_rate(unique-ID): {self.stats.hit_rate:.4f} "
             f"(hits={self.stats.hits}, misses={self.stats.misses})")
+        lines.append(
+            f"  hit_rate(token-wtd): {self.stats.token_hit_rate:.4f} "
+            f"(tok_hits={self.stats.token_hits}, "
+            f"tok_misses={self.stats.token_misses})")
         return "\n".join(lines)
 
     def get_gating_summary(self) -> str:
@@ -1093,4 +1169,99 @@ class ExpertCacheManager:
             pct = count / total * 100
             lines.append(f"    #{rank+1} expert {idx}: "
                          f"{int(count)} ({pct:.2f}%)")
+        return "\n".join(lines)
+
+    def get_miss_diagnostics(self) -> str:
+        """Return detailed miss-rate diagnostics for verification.
+
+        Reports per-layer and aggregate stats to answer:
+        1. Is valid_len truncating rlen? (measurement artifact)
+        2. How many unique experts does each layer need? (locality check)
+        3. Unique-ID hit rate vs token-weighted hit rate (definition check)
+        4. Per-layer variance (are some layers worse than others?)
+        """
+        if not hasattr(self, '_diag'):
+            return "Miss diagnostics: not initialized"
+        d = self._diag
+        steps = max(d['diag_steps'], 1)
+        lines = [f"=== Miss-Rate Diagnostics (step {self.current_step}, "
+                 f"last {steps} steps) ==="]
+
+        # ── Aggregate stats ──
+        lines.append(f"\n[Aggregate]")
+        lines.append(
+            f"  unique-ID hit_rate: {self.stats.hit_rate:.4f} "
+            f"(hits={self.stats.hits}, misses={self.stats.misses})")
+        lines.append(
+            f"  token-wtd hit_rate: {self.stats.token_hit_rate:.4f} "
+            f"(tok_hits={self.stats.token_hits}, "
+            f"tok_misses={self.stats.token_misses})")
+        lines.append(
+            f"  max_resident: {self.max_resident}, "
+            f"local_experts: {self.local_num_experts}, "
+            f"global_experts: {self.global_num_experts}")
+
+        # ── valid_len vs rlen check ──
+        lines.append(f"\n[valid_len vs rlen — artifact check]")
+        total_rlen = d['per_layer_rlen'].sum()
+        total_vlen = d['per_layer_valid_len'].sum()
+        if total_rlen > 0:
+            truncation_pct = max(0, (total_rlen - total_vlen)) / total_rlen * 100
+            lines.append(
+                f"  avg rlen/layer/step: {total_rlen / steps / self.num_layers:.1f}")
+            lines.append(
+                f"  avg valid_len/layer/step: {total_vlen / steps / self.num_layers:.1f}")
+            lines.append(
+                f"  truncation: {truncation_pct:.1f}% of routing entries clipped")
+        else:
+            lines.append("  no routing data yet")
+
+        # ── Per-layer detail (sample 5 layers: 0, 11, 23, 35, 47) ──
+        lines.append(f"\n[Per-Layer Detail (avg/step over {steps} steps)]")
+        lines.append(
+            f"  {'layer':>5} {'rlen':>7} {'vlen':>7} "
+            f"{'uniq_need':>9} {'uid_hit':>7} {'uid_miss':>8} "
+            f"{'uid_rate':>8} {'tok_hit':>8} {'tok_miss':>8} "
+            f"{'tok_rate':>8}")
+        sample_layers = [0, 11, 23, 35, 47]
+        for li in sample_layers:
+            if li >= self.num_layers:
+                continue
+            rlen_avg = d['per_layer_rlen'][li] / steps
+            vlen_avg = d['per_layer_valid_len'][li] / steps
+            uniq_avg = d['per_layer_unique_needed'][li] / steps
+            h = d['per_layer_hits'][li]
+            m = d['per_layer_misses'][li]
+            uid_rate = h / (h + m) if (h + m) > 0 else 0.0
+            th = d['per_layer_token_hits'][li]
+            tm = d['per_layer_token_misses'][li]
+            tok_rate = th / (th + tm) if (th + tm) > 0 else 0.0
+            lines.append(
+                f"  {li:>5} {rlen_avg:>7.0f} {vlen_avg:>7.0f} "
+                f"{uniq_avg:>9.1f} {h/steps:>7.1f} {m/steps:>8.2f} "
+                f"{uid_rate:>8.4f} {th/steps:>8.1f} {tm/steps:>8.2f} "
+                f"{tok_rate:>8.4f}")
+
+        # ── Unique-needed distribution across all layers ──
+        lines.append(f"\n[Unique-Needed Stats]")
+        uniq_all = d['per_layer_unique_needed'] / steps
+        lines.append(
+            f"  min={uniq_all.min():.1f}, max={uniq_all.max():.1f}, "
+            f"mean={uniq_all.mean():.1f}, std={uniq_all.std():.1f}")
+        over_max = int(np.sum(uniq_all > self.max_resident))
+        lines.append(
+            f"  layers needing > max_resident({self.max_resident}): "
+            f"{over_max}/{self.num_layers}")
+
+        # ── Cache occupancy snapshot ──
+        lines.append(f"\n[Cache Occupancy Snapshot]")
+        for li in sample_layers:
+            if li >= self.num_layers:
+                continue
+            occupied = sum(
+                1 for s in range(self.max_resident)
+                if self._slot_to_expert[li][s] != -1)
+            lines.append(
+                f"  layer {li}: {occupied}/{self.max_resident} slots used")
+
         return "\n".join(lines)

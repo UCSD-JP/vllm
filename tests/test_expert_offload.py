@@ -1124,5 +1124,107 @@ class TestBatchedD2H:
         assert "t_deferred_sync_us" in summary
 
 
+    def test_token_weighted_miss_rate(self):
+        """Token-weighted miss rate counts each routing entry, not unique IDs.
+
+        Scenario: 3 experts cached (0,1,2), expert 5 not cached.
+        Routing: [0,0,0,0,5] → 4 token-hits + 1 token-miss
+        Unique-ID: 1 hit (expert 0) + 1 miss (expert 5) = 50% unique hit rate
+        Token-weighted: 4 hits + 1 miss = 80% token hit rate
+        """
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        # Route: expert 0 (4 times, cached) + expert 5 (1 time, NOT cached)
+        layer._routing_snapshot[:5].copy_(
+            torch.tensor([0, 0, 0, 0, 5], dtype=torch.int32))
+        layer._routing_len.fill_(5)
+
+        # Reset stats
+        cache.stats = CacheStats()
+        r = cache.pre_step([layer])
+
+        # Unique-ID: expert 0 = hit, expert 5 = miss → 50%
+        assert cache.stats.hits == 1
+        assert cache.stats.misses == 1
+        assert abs(cache.stats.hit_rate - 0.5) < 0.01
+
+        # Token-weighted: 4 hits (expert 0 × 4) + 1 miss (expert 5 × 1) → 80%
+        assert cache.stats.token_hits == 4
+        assert cache.stats.token_misses == 1
+        assert abs(cache.stats.token_hit_rate - 0.8) < 0.01
+
+    def test_miss_diagnostics_output(self):
+        """get_miss_diagnostics() returns structured diagnostic info."""
+        cache = _make_cache(num_layers=2, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 2, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layers = [_make_mock_layer(global_E=8, local_E=8) for _ in range(2)]
+        for layer in layers:
+            layer._routing_snapshot[:3].copy_(
+                torch.tensor([0, 1, 2], dtype=torch.int32))
+            layer._routing_len.fill_(3)
+
+        cache.pre_step(layers)
+        diag = cache.get_miss_diagnostics()
+
+        assert "Miss-Rate Diagnostics" in diag
+        assert "unique-ID hit_rate" in diag
+        assert "token-wtd hit_rate" in diag
+        assert "valid_len vs rlen" in diag
+        assert "Per-Layer Detail" in diag
+        assert "Cache Occupancy" in diag
+
+    def test_per_layer_diagnostics_accumulate(self):
+        """Per-layer diagnostic counters accumulate across steps."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        layer._routing_snapshot[:3].copy_(
+            torch.tensor([0, 1, 2], dtype=torch.int32))
+        layer._routing_len.fill_(3)
+
+        # Run 5 steps
+        for _ in range(5):
+            cache.pre_step([layer])
+
+        # Check accumulation
+        d = cache._diag
+        assert d['diag_steps'] == 5
+        assert d['per_layer_rlen'][0] == 15  # 3 per step × 5
+        assert d['per_layer_unique_needed'][0] == 15  # 3 unique × 5
+        assert d['per_layer_hits'][0] == 15  # all hit (0,1,2 cached)
+        assert d['per_layer_misses'][0] == 0
+
+    def test_timing_summary_includes_token_weighted(self):
+        """get_timing_summary shows both unique-ID and token-weighted rates."""
+        cache = _make_cache(num_layers=1, local_E=8, global_E=8,
+                            max_resident=4)
+        _register_dummy_experts(cache, 1, 8, (8, 4), (4, 8))
+        with patch("torch.cuda.synchronize"):
+            cache.populate_initial_cache()
+
+        layer = _make_mock_layer(global_E=8, local_E=8)
+        layer._routing_snapshot[:2].copy_(
+            torch.tensor([0, 1], dtype=torch.int32))
+        layer._routing_len.fill_(2)
+        cache.pre_step([layer])
+
+        summary = cache.get_timing_summary()
+        assert "hit_rate(unique-ID)" in summary
+        assert "hit_rate(token-wtd)" in summary
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
