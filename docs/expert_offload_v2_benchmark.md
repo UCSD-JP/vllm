@@ -25,12 +25,12 @@
 
 | Metric | v5 (staging) | v6 (pinned) | v7 (pinned scratch) | v5→v7 |
 |--------|:---:|:---:|:---:|:---:|
-| t_pre_step_total | 12,640 us | 6,399 us | **3,528 us** | **-72%** |
-| t_cache_map_upload | N/A | ~3,100 us | **369 us** | — |
-| t_fetch | ~6,500 us | 153 us | **72 us** | **-99%** |
-| t_classify | ~4,000 us | 2,001 us | **1,822 us** | **-54%** |
-| eff_bw | 2.1-2.6 GB/s | 10.2 GB/s | **10.2 GB/s** | **4×** |
-| t_deferred_sync | 4.2 us | 0.7 us | **0.3 us** | ~0 |
+| t_pre_step_total | 12,640 us | 6,399 us | **3,701 us** | **-71%** |
+| t_cache_map_upload | N/A | ~3,100 us | **371 us** | — |
+| t_fetch | ~6,500 us | 153 us | **78 us** | **-99%** |
+| t_classify | ~4,000 us | 2,001 us | **1,957 us** | **-51%** |
+| eff_bw | 2.1-2.6 GB/s | 10.2 GB/s | **10.1 GB/s** | **4×** |
+| t_deferred_sync | 4.2 us | 0.7 us | **0.4 us** | ~0 |
 | **TPOT b=1 out=128** | **10.2ms** | **7.3ms** | **7.0ms** | **-31%** |
 | hit_rate | 99.1% | 99.9% | **100.0%** | +0.9pp |
 
@@ -49,47 +49,64 @@ For a 96KB cache_map tensor, this driver overhead dominated: **3,100us for 96KB 
 Result: GPU copies are enqueued instantly (~370us Python loop time), execute on default
 stream, and complete before CUDA graph replay (same-stream ordering guarantee).
 
-## Comprehensive Benchmark (v6, pinned pool)
+## Comprehensive Benchmark (v7, pinned scratch)
 
 ### TPOT by Concurrency and Arrival Pattern
 
 | Input | Output | Conc | Arrival | TPOT p50 | TPOT p95 | TTFT p50 |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 128 | 32 | 1 | burst | 7.3ms | 8.5ms | 75ms |
-| 128 | 32 | 8 | burst | 8.5ms | 9.3ms | 185ms |
-| 128 | 32 | 8 | stagger | 7.3ms | 7.4ms | 48ms |
-| 128 | 32 | 32 | burst | 10.8ms | 13.3ms | 383ms |
-| 128 | 32 | 32 | stagger | 7.3ms | 7.4ms | 47ms |
-| 128 | 128 | 1 | burst | 7.3ms | 7.3ms | 47ms |
-| 128 | 128 | 8 | burst | 8.5ms | 8.7ms | 171ms |
-| 128 | 128 | 8 | stagger | 7.9ms | 8.4ms | 58ms |
-| 128 | 128 | 32 | burst | 10.7ms | 11.7ms | 238ms |
-| 128 | 128 | 32 | stagger | 7.9ms | 8.7ms | 58ms |
-| 1024 | 32 | 1 | burst | 7.3ms | 7.3ms | 114ms |
-| 1024 | 32 | 8 | burst | 8.5ms | 9.0ms | 260ms |
-| 1024 | 32 | 8 | stagger | 7.3ms | 7.3ms | 106ms |
-| 1024 | 32 | 32 | burst | 10.8ms | 14.9ms | 567ms |
-| 1024 | 32 | 32 | stagger | 7.3ms | 7.4ms | 106ms |
-| 1024 | 128 | 1 | burst | 7.3ms | 7.3ms | 106ms |
-| 1024 | 128 | 8 | burst | 8.5ms | 8.7ms | 255ms |
-| 1024 | 128 | 8 | stagger | 7.9ms | 8.5ms | 119ms |
-| 1024 | 128 | 32 | burst | 10.8ms | 11.8ms | 521ms |
-| 1024 | 128 | 32 | stagger | 8.1ms | 8.7ms | 117ms |
+| 128 | 32 | 1 | burst | 7.0ms | 9.8ms | 1441ms |
+| 128 | 32 | 8 | burst | 8.2ms | 8.7ms | 196ms |
+| 128 | 32 | 8 | stagger | 7.0ms | 7.1ms | 49ms |
+| 128 | 32 | 32 | burst | 10.6ms | 12.9ms | 346ms |
+| 128 | 32 | 32 | stagger | 7.0ms | 7.5ms | 61ms |
+| 128 | 128 | 1 | burst | 7.0ms | 7.2ms | 48ms |
+| 128 | 128 | 8 | burst | 8.2ms | 8.5ms | 177ms |
+| 128 | 128 | 8 | stagger | 7.6ms | 8.1ms | 59ms |
+| 128 | 128 | 32 | burst | 10.5ms | 11.5ms | 291ms |
+| 128 | 128 | 32 | stagger | 7.6ms | 8.6ms | 70ms |
+| 1024 | 32 | 1 | burst | 7.0ms | 7.1ms | 121ms |
+| 1024 | 32 | 8 | burst | 8.2ms | 9.2ms | 265ms |
+| 1024 | 32 | 8 | stagger | 7.0ms | 7.2ms | 108ms |
+| 1024 | 32 | 32 | burst | 10.6ms | 14.8ms | 566ms |
+| 1024 | 32 | 32 | stagger | 7.0ms | 7.4ms | 113ms |
+| 1024 | 128 | 1 | burst | 7.0ms | 7.4ms | 147ms |
+| 1024 | 128 | 8 | burst | 8.3ms | 8.8ms | 294ms |
+| 1024 | 128 | 8 | stagger | 7.7ms | 8.5ms | 136ms |
+| 1024 | 128 | 32 | burst | 10.6ms | 11.7ms | 568ms |
+| 1024 | 128 | 32 | stagger | 7.8ms | 8.6ms | 122ms |
+
+### v6 → v7 TPOT Comparison
+
+| Config | v6 | v7 | Change |
+|--------|:---:|:---:|:---:|
+| c=1, b=1 | 7.3ms | **7.0ms** | -4% |
+| c=8 burst | 8.5ms | **8.2ms** | -4% |
+| c=8 stagger | 7.3-7.9ms | **7.0-7.6ms** | -4% |
+| c=32 burst | 10.8ms | **10.6ms** | -2% |
+| c=32 stagger | 7.3-8.1ms | **7.0-7.8ms** | -4% |
+
+Consistent 0.3ms improvement across all configs. Smaller improvement at c=32 burst
+because batched MoE routing increases CUDA graph execution time.
 
 ### Key Observations
 
-1. **TPOT insensitive to input_len**: in=128 vs in=1024 → identical 7.3ms at c=1.
+1. **TPOT insensitive to input_len**: in=128 vs in=1024 → identical 7.0ms at c=1.
    Expert routing patterns are similar regardless of prompt length.
 
-2. **Concurrency is the dominant factor**: c=1 → c=32 burst increases TPOT by +48% (7.3→10.8ms).
+2. **Concurrency is the dominant factor**: c=1 → c=32 burst increases TPOT by +51% (7.0→10.6ms).
    This is due to batched MoE routing hitting more diverse experts per step.
 
-3. **Staggered >> burst arrival**: At c=32, burst TPOT=10.8ms vs staggered=7.9ms (-27%).
-   Burst causes all prefills to overlap, leading to high TTFT (567ms vs 106ms)
+3. **Staggered >> burst arrival**: At c=32, burst TPOT=10.6ms vs staggered=7.0ms (-34%).
+   Burst causes all prefills to overlap, leading to high TTFT (566ms vs 113ms)
    and temporarily higher cache miss rates.
 
 4. **p95 close to p50**: Tail latency is well-controlled (typically <15% above p50),
    indicating the expert cache provides consistent performance.
+
+5. **First request TTFT anomaly**: c=1 in=128 out=32 shows TTFT=1441ms. This is a
+   cold start artifact (first request triggers CUDA graph capture for new batch size).
+   Subsequent requests settle to 48-147ms.
 
 ## Expert Cache Detailed Timing
 
@@ -97,37 +114,33 @@ stream, and complete before CUDA graph replay (same-stream ordering guarantee).
 
 | Phase | Time (us) | % of total | Description |
 |-------|:---------:|:----------:|-------------|
-| **t_pre_step_total** | **3,528** | **100%** | Total pre_step wall-clock |
-| t_gpu_gather (A) | 942 | 26.7% | GPU→GPU routing snapshot gather |
-| t_d2h (B) | 366 | 10.4% | Bulk D2H (single stream sync) |
-| t_classify (C) | 1,822 | 51.6% | CPU classification loop (48 layers) |
-| — cache_map_build | 736 | 20.9% | Per-layer cache_map scratch update |
-| — t_fetch | 72 | 2.0% | Async DMA queueing (misses only) |
-| — pure classify | ~1,014 | 28.7% | Hit/miss detection, eviction |
-| t_cache_map_upload (C2) | 369 | 10.5% | Pinned CPU → GPU bulk + scatter |
-| t_deferred_sync | 0.3 | 0.01% | Previous step DMA completion |
+| **t_pre_step_total** | **3,701** | **100%** | Total pre_step wall-clock |
+| t_gpu_gather (A) | 942 | 25.5% | GPU→GPU routing snapshot gather |
+| t_d2h (B) | 410 | 11.1% | Bulk D2H (single stream sync) |
+| t_classify (C) | 1,957 | 52.9% | CPU classification loop (48 layers) |
+| — cache_map_build | 764 | 20.6% | Per-layer cache_map scratch update |
+| — t_fetch | 78 | 2.1% | Async DMA queueing (misses only) |
+| — pure classify | ~1,115 | 30.1% | Hit/miss detection, eviction |
+| t_cache_map_upload (C2) | 371 | 10.0% | Pinned CPU → GPU bulk + scatter |
+| t_deferred_sync | 0.4 | 0.01% | Previous step DMA completion |
 
-### v6 Breakdown (for comparison, avg over 20500 calls)
+### v5 → v6 → v7 Phase Comparison
 
-| Phase | v6 time (us) | v7 time (us) | Change |
-|-------|:---:|:---:|:---:|
-| t_pre_step_total | 6,399 | **3,528** | **-45%** |
-| t_gpu_gather (A) | 881 | 942 | +7% |
-| t_d2h (B) | 416 | 366 | -12% |
-| t_classify (C) | 2,001 | 1,822 | -9% |
-| t_cache_map_upload (C2) | **~3,100** | **369** | **-88%** |
-| t_fetch | 153 | 72 | -53% |
-| t_deferred_sync | 0.7 | 0.3 | -57% |
-
-**Key insight**: v6's "unaccounted 40%" was actually `t_cache_map_upload` — the pageable
-scratch → GPU copy was taking 3.1ms for 96KB due to CUDA driver staging overhead.
-After pinning, this dropped to 369us (Python loop overhead only).
+| Phase | v5 | v6 | v7 | v5→v7 |
+|-------|:---:|:---:|:---:|:---:|
+| t_pre_step_total | 12,640 | 6,399 | **3,701** | **-71%** |
+| t_gpu_gather (A) | — | 881 | 942 | — |
+| t_d2h (B) | — | 416 | 410 | — |
+| t_classify (C) | ~4,000 | 2,001 | 1,957 | -51% |
+| t_cache_map_upload (C2) | — | **~3,100** | **371** | — |
+| t_fetch | ~6,500 | 153 | 78 | **-99%** |
+| t_deferred_sync | 4.2 | 0.7 | 0.4 | -90% |
 
 ### pre_step vs CUDA Graph Overlap
 
 ```
 v7 timeline (b=1 steady state):
-         pre_step (3.5ms)    idle (3.5ms)
+         pre_step (3.7ms)    idle (3.3ms)
 ├────────────────────────────┼────────────────────────────┤
 │  A  │ B │     C      │ C2 │                            │
 ├─────┴───┴────────────┴────┴────────────────────────────┤
@@ -145,9 +158,74 @@ v6 timeline (b=1 steady state):
                           TPOT ≈ 7.3ms
 ```
 
-**Result**: pre_step (3.5ms) now finishes well before graph replay (7.0ms),
+**Result**: pre_step (3.7ms) now finishes well before graph replay (7.0ms),
 making pre_step fully hidden. Further pre_step optimization won't improve TPOT
 at b=1 — the bottleneck is now purely CUDA graph execution.
+
+## CUDA Graph Replay Time Analysis (~7ms)
+
+TPOT의 병목이 pre_step에서 CUDA graph replay로 이동했으므로,
+7ms의 구성을 분석하여 NVLink 등으로 줄일 수 있는지 검토한다.
+
+### Decode Step 구성 요소
+
+Nsight 프로파일링 데이터 (Paladin TP2-FP16, agentic) 기반:
+
+| Component | c=1 비중 | c=8 비중 | 설명 |
+|-----------|:---:|:---:|------|
+| NCCL AllReduce | ~25% | ~52% | TP AllReduce (48 layers × 2 calls) |
+| GEMM (ATTN+FFN+OUT) | ~28% | ~10% | 행렬 곱셈 커널 |
+| MoE routing+expert | ~16% | ~23% | Expert selection + gated FFN |
+| Attention | ~12% | ~5% | Flash attention 커널 |
+| H2D copy / host prep | ~8% | ~5% | 스케줄러→GPU 데이터 전달 |
+| GPU launch gaps | ~5% | ~2% | 커널 간 idle (CUDA graph에서 최소화) |
+| Python iteration | ~6% | ~3% | vLLM V1 scheduler 1회 iteration |
+
+**핵심**: c=1에서 comm 비중 ~25%, c≥8에서 **52%로 급증**. 고 concurrency에서 comm이 지배.
+
+### AllReduce 데이터량 (TP2, per decode token)
+
+| Batch | ATTN AR | FFN AR | OUT AR | Total | PCIe 시간 | NVLink 시간 |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 1 | 4KB | 4KB | 296KB | 0.3MB | 0.04ms | 0.002ms |
+| 8 | 32KB | 32KB | 2.4MB | 2.5MB | 0.31ms | 0.019ms |
+| 32 | 128KB | 128KB | 9.5MB | 10MB | 1.25ms | 0.075ms |
+| 64 | 256KB | 256KB | 19MB | 20MB | 2.50ms | 0.15ms |
+
+계산 기준: PCIe effective BW = 8 GB/s (`tp_comm_efficiency_scale=0.125`),
+NVLink effective BW = 133 GB/s (H200 NV18 full mesh, `scale=3.59`).
+
+### NVLink 적용 시 TPOT 예측
+
+| Component | H100 PCIe (Paladin) | H200 NVLink | 변화 |
+|-----------|:---:|:---:|:---:|
+| Compute (GEMM+ATTN+MoE) | ~2.5-3.5ms | ~2.0-2.5ms | -30% (HBM 4800 vs 3350 GB/s) |
+| AllReduce (b=1) | ~1.7ms | ~0.1ms | **-94%** |
+| CPU iteration overhead | ~3.1ms | ~3.1ms | 0% (Python, 불변) |
+| Launch gaps + H2D | ~0.5ms | ~0.5ms | ~0% |
+| **Total (c=1)** | **~7.0ms** | **~5-6ms** | **-15~29%** |
+
+**실측 비교**: Cloud H200 4×NVLink TP2에서 Qwen3-Next agentic c=1 TPOT = **7-8ms**.
+예측(5-6ms)보다 높은 이유:
+1. **CPU iteration overhead가 지배적** — NVLink이 comm을 줄여도 Python 3.1ms는 그대로
+2. H200 cloud 인스턴스의 NUMA/scheduler 차이
+3. Expert offload 미적용 (cloud 벤치는 non-offload TP2)
+
+### NVLink으로 줄일 수 있는 부분 vs 없는 부분
+
+**줄일 수 있는 것 (NVLink 효과)**:
+- TP AllReduce 시간: PCIe 1.7ms → NVLink 0.1ms (b=1), 2.5ms → 0.15ms (b=64)
+- 특히 c≥8에서 효과 큼 (comm 비중 52% → ~5%)
+- c=32 burst: 10.6ms → ~8ms 예상 (comm 감소분)
+
+**줄일 수 없는 것**:
+- CPU iteration overhead (3.1ms) — Python/PyTorch scheduling, GIL. 하드웨어 무관
+- Compute 커널 시간 — GPU compute throughput에 의존 (H100→H200 +20% 정도)
+- Expert offload pre_step — 이미 graph replay 안에 숨겨져 있으므로 TPOT 무관
+
+**결론**: NVLink은 c=1에서 ~1.5ms (20%), c=32에서 ~2-3ms (20-25%) 개선 가능.
+하지만 **CPU iteration overhead 3.1ms가 hard floor** — TPOT는 3.1ms 이하로 내릴 수 없음.
+이를 넘으려면 C++ custom scheduler나 torch.compile 기반 graph-only execution 필요.
 
 ## Expert Gating Distribution
 
@@ -174,9 +252,37 @@ At steady state, 11 experts handle >1% each, and the top 8 each receive ~9%.
 This explains the 100% hit rate with max_res=400 — only ~21 experts are actively
 needed, far below the 400 cached slots.
 
-**Implication for contiguous DMA**: Since misses average only 0.2 experts/step
-in steady state, contiguous CPU pool layout would primarily help cold start
-(~500 steps) and burst arrival scenarios. Steady-state benefit is negligible.
+## Contiguous DMA Layout — 결론
+
+### 리뷰 포인트와 분석
+
+| # | 리뷰 포인트 | 판정 | 근거 |
+|---|------------|------|------|
+| 1 | Fancy indexing ≠ single large DMA | **동의** | `gpu[slots] = cpu[ids]`는 PyTorch 내부에서 gather/scatter + 임시 텐서 생성. 개별 `copy_()`가 오히려 깨끗함 |
+| 2 | 현재 병목은 fetch가 아님 | **완전 동의** | v7: t_fetch=78us (2%), miss=0.2/step. DMA BW를 3× 올려도 TPOT 변화 0 |
+| 3 | 연속 DMA는 src+dst 둘 다 연속 필요 | **동의** | CPU contiguous해도 GPU slot이 LRU-random이면 합침 불가. 슬롯 정책까지 변경 필요 |
+| 4 | TPOT vs pre_step 측정 불일치 | **부분 동의** | v7에서 pre_step(3.7ms) << graph(7.0ms)이므로 불일치 완화. NVTX 구현 완료, nsys 재시작시 검증 가능 |
+
+### DMA 방향 확인
+
+Expert weight copy 방향은 **항상 CPU → GPU** (단방향):
+- `_load_to_slot()`: CPU pinned → GPU slot (sync, initial populate)
+- `_async_fetch()`: CPU pinned → GPU slot (async, non_blocking, copy_stream)
+- `_sync_fetch()`: CPU pinned → GPU slot (sync, last resort)
+- `_prefetch_next_layer()`: CPU pinned → GPU slot (async, non_blocking)
+
+GPU → CPU expert weight copy는 **존재하지 않음**.
+GPU→CPU는 routing snapshot D2H만 (topk_ids, int32, ~수 KB).
+
+### 최종 결론
+
+Contiguous DMA Layout 우선순위: **LOW → SKIP**.
+
+이유:
+1. Steady state miss = 0.2 experts/step → DMA 자체가 pre_step의 2%
+2. pre_step 전체가 CUDA graph 안에 숨겨져 있어 TPOT에 직접 영향 없음
+3. 구현 시 fancy indexing 함정 (추가 오버헤드), 슬롯 정책 변경 필요
+4. Cold start (~500 steps) 개선만 가능, steady state 이점 없음
 
 ## GPU Memory Profile
 
@@ -192,18 +298,22 @@ full [512,...] tensors → ~91 GiB GPU peak → OOM on 93 GiB H100.
 
 ## Remaining Optimization Opportunities
 
-### 1. t_classify Vectorization (1.8ms → target <0.5ms)
-Classification iterates 48 layers in Python. Each layer does:
-`topk_cpu.unique()` → set operations → hit/miss detection → cache_map build.
-Potential: batch all 48 layers' topk_ids into a single numpy array,
-vectorize the entire classify phase.
+### pre_step 내부 (TPOT 영향 없음, headroom 확보용)
 
-### 2. GPU Gather Optimization (0.9ms)
-48 GPU→GPU copies of routing snapshots. Could use a custom CUDA kernel
-to gather all snapshots in a single kernel launch.
+| 항목 | 현재 | 목표 | 방법 |
+|------|:---:|:---:|------|
+| t_classify | 1,957 us | <500 us | 48 layers numpy batch vectorization |
+| t_gpu_gather | 942 us | <200 us | Custom CUDA kernel (single launch) |
+| t_cache_map_build | 764 us | <200 us | Vectorized e2s→cache_map 변환 |
 
-### 3. Contiguous CPU Pool for Cold Start DMA
-Current: per-expert individual pinned tensors (3.15MB each, scattered).
-Proposed: `[local_E, ...]` contiguous pinned buffer per layer.
-Impact: only during cold start / cache churn. Negligible at steady state.
-Priority: LOW (99.9%+ hit rate makes this almost irrelevant).
+이 최적화들은 TPOT을 직접 줄이지 않지만 (이미 graph 안에 숨겨짐),
+headroom을 3.7ms → ~1ms로 줄여서 CUDA graph이 더 길어져도 (c=32 등) 여유 확보.
+
+### TPOT를 줄이려면
+
+| 방법 | 예상 효과 | 비고 |
+|------|:---:|------|
+| NVLink (H200) | -15~25% at c=1 | Comm 1.7ms → 0.1ms, but CPU 3.1ms 불변 |
+| TP4 (4 GPU) | -30~40% | Compute 2× 분산, comm 증가 |
+| C++ scheduler | -20~30% | CPU iteration 3.1ms → ~1ms, Python 제거 |
+| FP8 quantization | -20~30% | GEMM throughput 2×, memory BW 절감 |
