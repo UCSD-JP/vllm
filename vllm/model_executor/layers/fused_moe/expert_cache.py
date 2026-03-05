@@ -7,16 +7,20 @@ Single implementation path:
 - CPU pinned backing store (direct async DMA, no staging)
 """
 
+import os
 import torch
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
-from collections import defaultdict
+from collections import defaultdict, deque
 import logging
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Module-level ref for group boundary custom op (avoids ForwardContext coupling)
+_global_expert_cache_ref: Dict = {}
 
 
 @dataclass
@@ -42,6 +46,10 @@ class CacheStats:
     # Token-weighted counters (each routing entry, not unique IDs)
     token_hits: int = 0
     token_misses: int = 0
+    # Phase 1 miss mitigation counters
+    never_evict_protections: int = 0    # 3-A: eviction skipped due to K-step recency
+    union_prediction_extras: int = 0    # 3-B: extra experts pre-fetched beyond N-1
+    eager_fallback_triggers: int = 0    # 3-E: steps where miss_count>0 caused eager
 
     @property
     def hit_rate(self) -> float:
@@ -123,6 +131,30 @@ class ExpertCacheManager:
         self._access_count: Dict[Tuple[int, int], int] = defaultdict(int)
         self._last_access: Dict[Tuple[int, int], int] = defaultdict(int)
         self._pinned: Set[Tuple[int, int]] = set()
+
+        # Phase 1 miss mitigation (default OFF — explicit opt-in via env vars)
+        self._never_evict_k = int(
+            os.environ.get("VLLM_EXPERT_NEVER_EVICT_K", "0"))
+        self._union_steps_k = int(
+            os.environ.get("VLLM_EXPERT_UNION_STEPS", "1"))
+        # 3-B: per-layer routing history (deque of sets of local expert IDs)
+        self._routing_history: List[deque] = [
+            deque(maxlen=max(self._union_steps_k, 1))
+            for _ in range(num_layers)
+        ]
+
+        # Miss injection config (#3 — quality eval)
+        self._inject_miss_rate = float(
+            os.environ.get("VLLM_EXPERT_INJECT_MISS_RATE", "0"))
+        _inject_layers_str = os.environ.get(
+            "VLLM_EXPERT_INJECT_MISS_LAYERS", "")
+        if _inject_layers_str:
+            self._inject_miss_layers: Optional[Set[int]] = {
+                int(x.strip()) for x in _inject_layers_str.split(",")
+                if x.strip()
+            }
+        else:
+            self._inject_miss_layers = None  # all layers
 
         # CPU pinned backing store — enables direct async DMA to GPU
         # without intermediate staging copies (pageable→pinned eliminated)
@@ -435,6 +467,13 @@ class ExpertCacheManager:
                 continue
             if lid in self._prefetch_pending.get(layer_idx, set()):
                 continue
+            # 3-A: Never-evict experts used in last K steps
+            _nevict_k = getattr(self, '_never_evict_k', 0)
+            if _nevict_k > 0:
+                last_used = self._last_access.get(key, 0)
+                if self.current_step - last_used < _nevict_k:
+                    self.stats.never_evict_protections += 1
+                    continue
 
             if self.config.eviction_policy == "lru":
                 priority = self._last_access.get(key, 0)
@@ -471,6 +510,14 @@ class ExpertCacheManager:
 
     def __init_v2_scratch(self):
         """Lazy-init per-layer scratch maps to avoid repeated allocation."""
+        # Phase 1: lazy-init routing history (for object.__new__ bypass).
+        # Defaults to disabled (K=0, union=1) — only __init__ reads env vars.
+        if not hasattr(self, '_routing_history'):
+            self._never_evict_k = 0
+            self._union_steps_k = 1
+            self._routing_history = [
+                deque(maxlen=1) for _ in range(self.num_layers)
+            ]
         if hasattr(self, '_scratch_maps'):
             return
         # Stacked CPU scratch tensor — views become per-layer scratch maps.
@@ -513,7 +560,28 @@ class ExpertCacheManager:
             'per_layer_token_misses': np.zeros(self.num_layers, dtype=np.int64),
             'diag_steps': 0,
             'diag_dump_interval': 100,  # log every N steps
+            # Quality eval: token-layer any-miss (#1)
+            'tokens_with_any_miss': 0,
+            'tokens_total': 0,
+            'miss_layers_total': 0,  # sum of miss-layer counts per token
+            # Eager routing boundary counters (per-layer graph boundary)
+            'eager_boundary_calls': 0,
+            'eager_boundary_hits': 0,   # GPU fast path — all cached
+            'eager_boundary_misses': 0,  # CPU fallback — had miss
+            # Quality eval: per-layer miss rate for weighted calc (#2)
+            'per_layer_miss_rate_accum': np.zeros(
+                self.num_layers, dtype=np.float64),
+            'per_layer_miss_rate_steps': 0,
+            # Step-level churn tracking
+            'step_loads_total': 0,       # cumulative experts loaded
+            'step_evicts_total': 0,      # cumulative experts evicted
+            'step_loads_hist': [],       # per-step load counts (last N)
+            'step_evicts_hist': [],      # per-step evict counts (last N)
+            'step_overlap_hist': [],     # step-to-step needed-set overlap ratio
+            'step_churn_max_hist': 200,  # keep last N steps
         }
+        # Previous step's needed set per layer (for overlap tracking)
+        self._prev_needed_per_layer: Dict[int, Set[int]] = {}
         # Expert gating distribution: per-expert access counts
         self._gating_histogram = np.zeros(
             self.global_num_experts, dtype=np.int64)
@@ -786,6 +854,23 @@ class ExpertCacheManager:
                     if slot != -1:
                         scratch[lid] = slot
 
+        # Quality eval #3: miss injection for KL/top-1 flip measurement
+        _inject_rate = getattr(self, '_inject_miss_rate', 0)
+        if _inject_rate > 0:
+            _inject_layers = getattr(self, '_inject_miss_layers', None)
+            if _inject_layers is None or layer_idx in _inject_layers:
+                valid_mask = scratch >= 0
+                n_valid = int(valid_mask.sum().item())
+                if n_valid > 0:
+                    inject_mask = (torch.rand(scratch.shape) < _inject_rate)
+                    inject_mask &= valid_mask
+                    n_injected = int(inject_mask.sum().item())
+                    if n_injected > 0:
+                        scratch[inject_mask] = -1
+                        if not hasattr(self, '_inject_count'):
+                            self._inject_count = 0
+                        self._inject_count += n_injected
+
         if not skip_gpu_upload:
             # In-place copy preserves data_ptr
             layer._cache_map.copy_(scratch.to(layer._cache_map.device))
@@ -835,6 +920,10 @@ class ExpertCacheManager:
         self.__init_v2_scratch()
         self._init_batched_d2h(layers)
 
+        # Snapshot eviction/load counters for per-step delta
+        _evict_before = self.stats.evictions
+        _loads_before = self.stats.sync_fetches
+
         # ── Phase 0: Deferred sync from previous step ─────────────
         if _nvtx:
             _nvtx.range_push("phase0_deferred_sync")
@@ -855,6 +944,11 @@ class ExpertCacheManager:
         total_misses = 0
         total_routed = 0
         needs_sync = False
+
+        # Quality eval #1: per-token any-miss tracking
+        _ntok = num_tokens if num_tokens > 0 else 0
+        _token_miss_flags = None  # lazy-init when we know num_tokens
+        _token_miss_layers = None
 
         # ── Phase A: GPU→GPU gather ──────────────────────────────
         if _nvtx:
@@ -896,6 +990,7 @@ class ExpertCacheManager:
         if _nvtx:
             _nvtx.range_push("phaseC_classify_fetch")
         t_classify_start = time.monotonic()
+        _step_needed_per_layer: Dict[int, Set[int]] = {}
         for i in active_indices:
             layer = layers[i]
 
@@ -913,6 +1008,22 @@ class ExpertCacheManager:
                 needed_global = set(topk_cpu.unique().tolist())
                 needed_local = self._globals_to_locals_cached(
                     i, needed_global)
+
+                # 3-B: Union prediction — expand with last K steps' routing.
+                # actual_needed_local: used for hit/miss stats (real routing)
+                # needed_local: expanded for prefetch/eviction protection
+                actual_needed_local = set(needed_local)
+                self._routing_history[i].append(frozenset(needed_local))
+                if (self._union_steps_k > 1
+                        and len(self._routing_history[i]) > 1):
+                    union_local = set()
+                    for past in self._routing_history[i]:
+                        union_local |= past
+                    extras = union_local - actual_needed_local
+                    if extras:
+                        needed_local = needed_local | extras
+                        self.stats.union_prediction_extras += len(extras)
+
                 # Gating distribution: accumulate per-expert counts
                 # Sample first active layer only (O(n) numpy bincount)
                 if i == active_indices[0]:
@@ -926,15 +1037,19 @@ class ExpertCacheManager:
                 topk_cpu = None
                 # First step (warmup): use initial cache contents
                 needed_local = set()
+                actual_needed_local = set()
                 for lid in range(self.local_num_experts):
                     if self._expert_to_slot[i][lid] != -1:
                         needed_local.add(lid)
+                        actual_needed_local.add(lid)
 
-            total_routed += len(needed_local)
+            # Stats use actual_needed_local (real routing, not union-expanded)
+            total_routed += len(actual_needed_local)
+            _step_needed_per_layer[i] = set(actual_needed_local)
 
-            # 2. Hit/miss classification (unique-ID based)
+            # 2. Hit/miss classification (unique-ID based, actual routing)
             miss_ids = []
-            for lid in needed_local:
+            for lid in actual_needed_local:
                 key = (i, lid)
                 if self._expert_to_slot[i][lid] != -1:
                     self._access_count[key] += 1
@@ -949,60 +1064,116 @@ class ExpertCacheManager:
             # 2b. Token-weighted hit/miss (each routing entry counted)
             if topk_cpu is not None and rlen > 0:
                 miss_set = set(miss_ids)
-                # Count per-token routing entries that hit vs miss
-                # Convert global→local for each routing entry
                 emap_cpu = (self._emap_cpu_cache[i]
                             if hasattr(self, '_emap_cpu_cache')
                             and i < len(self._emap_cpu_cache)
                             else None)
-                tk_hit = 0
-                tk_miss = 0
-                for gid_t in topk_cpu.tolist():
-                    gid = int(gid_t)
+                if not miss_set:
+                    # ── Fast path: all cached → vectorized counting ──
                     if emap_cpu is not None:
-                        if 0 <= gid < emap_cpu.shape[0]:
-                            lid = int(emap_cpu[gid].item())
+                        # TP mode: only count entries on this rank
+                        valid_mask = (topk_cpu >= 0) & (
+                            topk_cpu < emap_cpu.shape[0])
+                        valid_gids = topk_cpu[valid_mask]
+                        if len(valid_gids) > 0:
+                            tk_hit = int(
+                                (emap_cpu[valid_gids] >= 0).sum().item())
                         else:
-                            lid = -1
+                            tk_hit = 0
                     else:
-                        lid = gid if 0 <= gid < self.local_num_experts else -1
-                    if lid == -1:
-                        continue
-                    if lid in miss_set:
-                        tk_miss += 1
-                    else:
-                        tk_hit += 1
+                        # TP=1: all valid entries are hits
+                        tk_hit = int(((topk_cpu >= 0) & (
+                            topk_cpu < self.local_num_experts)).sum().item())
+                    tk_miss = 0
+                else:
+                    # ── Full path: iterate per routing entry ──
+                    tk_hit = 0
+                    tk_miss = 0
+                    for gid_t in topk_cpu.tolist():
+                        gid = int(gid_t)
+                        if emap_cpu is not None:
+                            if 0 <= gid < emap_cpu.shape[0]:
+                                lid = int(emap_cpu[gid].item())
+                            else:
+                                lid = -1
+                        else:
+                            lid = gid if 0 <= gid < self.local_num_experts else -1
+                        if lid == -1:
+                            continue
+                        if lid in miss_set:
+                            tk_miss += 1
+                        else:
+                            tk_hit += 1
                 self.stats.token_hits += tk_hit
                 self.stats.token_misses += tk_miss
+
+                # 2b-Q: Per-token any-miss tracking (Quality #1)
+                # Skipped when miss_set is empty (no misses → no per-token tracking needed)
+                if _ntok > 0 and miss_set and hasattr(self, '_diag'):
+                    top_k = getattr(layer, 'top_k', 10)
+                    actual_ntok = min(_ntok, rlen // top_k) if top_k > 0 else 0
+                    if actual_ntok > 0:
+                        if _token_miss_flags is None:
+                            _token_miss_flags = np.zeros(
+                                actual_ntok, dtype=np.bool_)
+                            _token_miss_layers = np.zeros(
+                                actual_ntok, dtype=np.int32)
+                        # Check per-token: does any of its top-k hit miss_set?
+                        topk_np = topk_cpu[:actual_ntok * top_k].numpy()
+                        topk_2d = topk_np.reshape(actual_ntok, top_k)
+                        for t_idx in range(actual_ntok):
+                            for gid in topk_2d[t_idx]:
+                                gid = int(gid)
+                                if emap_cpu is not None:
+                                    if 0 <= gid < emap_cpu.shape[0]:
+                                        lid = int(emap_cpu[gid].item())
+                                    else:
+                                        lid = -1
+                                else:
+                                    lid = (gid if 0 <= gid
+                                           < self.local_num_experts
+                                           else -1)
+                                if lid != -1 and lid in miss_set:
+                                    _token_miss_flags[t_idx] = True
+                                    _token_miss_layers[t_idx] += 1
+                                    break  # one miss per layer is enough
 
             # 2c. Per-layer diagnostics accumulation
             if hasattr(self, '_diag'):
                 li = min(i, self.num_layers - 1)
                 self._diag['per_layer_rlen'][li] += raw_rlen
                 self._diag['per_layer_valid_len'][li] += valid_len
-                self._diag['per_layer_unique_needed'][li] += len(needed_local)
+                self._diag['per_layer_unique_needed'][li] += len(actual_needed_local)
                 self._diag['per_layer_hits'][li] += (
-                    len(needed_local) - len(miss_ids))
+                    len(actual_needed_local) - len(miss_ids))
                 self._diag['per_layer_misses'][li] += len(miss_ids)
                 if topk_cpu is not None and rlen > 0:
                     self._diag['per_layer_token_hits'][li] += tk_hit
                     self._diag['per_layer_token_misses'][li] += tk_miss
 
-            # 3. Async-fetch misses (DMA issued, not synced)
+            # 3. Async-fetch: actual misses + speculative union extras
             t_fetch_start = time.monotonic()
-            if miss_ids:
-                cached_needed = needed_local - set(miss_ids)
+            # Collect all experts to fetch: actual misses + union extras not cached
+            fetch_ids = list(miss_ids)
+            union_extras_to_fetch = []
+            if needed_local != actual_needed_local:
+                for lid in (needed_local - actual_needed_local):
+                    if self._expert_to_slot[i][lid] == -1:
+                        union_extras_to_fetch.append(lid)
+                fetch_ids.extend(union_extras_to_fetch)
+            if fetch_ids:
+                cached_needed = needed_local - set(fetch_ids)
                 # Record slots BEFORE fetch so we know which are pending
                 pre_fetch_slots = set()
-                for lid in miss_ids:
+                for lid in fetch_ids:
                     slot = self._expert_to_slot[i][lid]
                     if slot != -1:
                         pre_fetch_slots.add(slot)
-                self._async_fetch(i, miss_ids, protected=cached_needed)
+                self._async_fetch(i, fetch_ids, protected=cached_needed)
                 needs_sync = True
                 # Track NEW slots allocated by _async_fetch (not in pre_fetch)
                 pending = set()
-                for lid in miss_ids:
+                for lid in fetch_ids:
                     slot = self._expert_to_slot[i][lid]
                     if slot != -1 and slot not in pre_fetch_slots:
                         pending.add(slot)
@@ -1017,6 +1188,25 @@ class ExpertCacheManager:
             t_cmap_delta = time.monotonic() - t_cmap_start
             self._timing['t_cache_map_us'] += t_cmap_delta * 1e6
             self._timing['t_cache_map_build_us'] += t_cmap_delta * 1e6
+
+        # Quality eval #1: accumulate per-token any-miss counters
+        if (_token_miss_flags is not None and hasattr(self, '_diag')
+                and 'tokens_with_any_miss' in self._diag):
+            self._diag['tokens_with_any_miss'] += int(
+                _token_miss_flags.sum())
+            self._diag['tokens_total'] += len(_token_miss_flags)
+            self._diag['miss_layers_total'] += int(
+                _token_miss_layers.sum())
+
+        # Quality eval #2: per-layer miss rate accumulation
+        if hasattr(self, '_diag') and 'per_layer_miss_rate_accum' in self._diag:
+            d = self._diag
+            d['per_layer_miss_rate_steps'] += 1
+            for li in range(self.num_layers):
+                h = d['per_layer_hits'][li]
+                m = d['per_layer_misses'][li]
+                if h + m > 0:
+                    d['per_layer_miss_rate_accum'][li] = m / (h + m)
 
         t_classify = time.monotonic() - t_classify_start
         if _nvtx:
@@ -1086,6 +1276,35 @@ class ExpertCacheManager:
         self._timing['t_sync_us'] += t_sync * 1e6
         self._timing['pre_step_calls'] += 1
 
+        # Step-level churn tracking
+        if hasattr(self, '_diag') and 'step_loads_total' in self._diag:
+            d = self._diag
+            step_evicts = self.stats.evictions - _evict_before
+            step_loads = self.stats.sync_fetches - _loads_before
+            # Also count async loads from _async_fetch
+            step_loads += total_misses  # misses trigger async fetch
+            d['step_loads_total'] += step_loads
+            d['step_evicts_total'] += step_evicts
+            max_hist = d['step_churn_max_hist']
+            if len(d['step_loads_hist']) < max_hist:
+                d['step_loads_hist'].append(step_loads)
+                d['step_evicts_hist'].append(step_evicts)
+
+            # Step-to-step expert overlap (union across all layers)
+            if hasattr(self, '_prev_needed_per_layer'):
+                cur_union = set()
+                prev_union = set()
+                for li in active_indices:
+                    cur = _step_needed_per_layer.get(li, set())
+                    cur_union.update((li, lid) for lid in cur)
+                    prev = self._prev_needed_per_layer.get(li, set())
+                    prev_union.update((li, lid) for lid in prev)
+                if prev_union and cur_union:
+                    overlap = len(cur_union & prev_union) / len(cur_union)
+                    if len(d['step_overlap_hist']) < max_hist:
+                        d['step_overlap_hist'].append(overlap)
+            self._prev_needed_per_layer = _step_needed_per_layer
+
         # Periodic miss-rate diagnostic dump
         if hasattr(self, '_diag'):
             self._diag['diag_steps'] += 1
@@ -1096,6 +1315,7 @@ class ExpertCacheManager:
         return {
             'total_misses': total_misses,
             'total_routed': total_routed,
+            'has_pending_dma': needs_sync,
             'miss_ratio': miss_ratio,
             't_pre_step_us': t_total * 1e6,
             't_gpu_gather_us': t_gather * 1e6,
@@ -1103,6 +1323,250 @@ class ExpertCacheManager:
             't_classify_us': t_classify * 1e6,
             't_sync_us': t_sync * 1e6,
         }
+
+    def pre_step_single_layer(self, layer_idx: int,
+                              topk_ids: torch.Tensor, layer):
+        """3-C Eager Routing: fresh routing → sync fetch → cache_map update.
+
+        Called from eager_routing_boundary custom op INSIDE forward pass
+        (between graph pieces). Uses current-step routing (not N-1 stale).
+
+        GPU fast path: checks cache_map on GPU first (~10us).
+        Only falls back to expensive CPU path (~260us) when there's a miss.
+
+        Unlike pre_step() which batches all layers with async DMA,
+        this method handles a single layer synchronously because:
+        1. We're outside CUDA graph (graph boundary)
+        2. topk_ids is already on GPU (just computed by router)
+        3. Must complete before next graph piece executes MoE kernel
+
+        Args:
+            layer_idx: MoE layer index
+            topk_ids: Fresh routing tensor from router [num_tokens, top_k]
+            layer: FusedMoE module (for _cache_map buffer)
+        """
+        if not getattr(self, "_batched_d2h_ready", False):
+            return
+
+        _nvtx = torch.cuda.nvtx if hasattr(torch.cuda, 'nvtx') else None
+        if _nvtx:
+            _nvtx.range_push(f"eager_routing_L{layer_idx}")
+
+        # Get valid routing entries (excludes CUDA graph padding).
+        # topk_ids is full graph buffer [max_batch, top_k] — padding
+        # positions have valid-looking but meaningless expert IDs that
+        # would always trigger false misses in cache_map.
+        # _routing_len tells us how many entries are real.
+        if hasattr(layer, '_routing_len') and layer._routing_len is not None:
+            rlen = int(layer._routing_len[0].item())
+        else:
+            rlen = topk_ids.numel()
+        if rlen <= 0:
+            if _nvtx:
+                _nvtx.range_pop()
+            return
+
+        # Use _routing_snapshot (1D, written by graph piece A) for
+        # valid entries, or fall back to topk_ids[:rlen]
+        if (hasattr(layer, '_routing_snapshot')
+                and layer._routing_snapshot is not None):
+            valid_ids = layer._routing_snapshot[:rlen]
+        else:
+            valid_ids = topk_ids.flatten()[:rlen]
+
+        # GPU fast path: check cache_map for misses without CPU roundtrip
+        # layer._cache_map[gid] >= 0 means expert is cached in a slot
+        cache_hits = layer._cache_map[valid_ids]      # GPU gather ~3us
+        has_miss = (cache_hits < 0).any().item()       # bool scalar ~5us
+
+        # Diag: track eager boundary calls
+        if hasattr(self, '_diag'):
+            self._diag['eager_boundary_calls'] += 1
+
+        if not has_miss:
+            # All experts cached — update access metadata for eviction policy
+            # Without this, frequently-used experts look stale to LRU/LFU
+            unique_global_gpu = valid_ids.unique()
+            unique_global_hit = unique_global_gpu.cpu().tolist()
+            needed_global_hit = {int(g) for g in unique_global_hit if g >= 0}
+            needed_local_hit = self._globals_to_locals_cached(
+                layer_idx, needed_global_hit)
+            for lid in needed_local_hit:
+                key = (layer_idx, lid)
+                self._access_count[key] += 1
+                self._last_access[key] = self.current_step
+            if hasattr(self, '_diag'):
+                self._diag['eager_boundary_hits'] += 1
+                li = min(layer_idx, self.num_layers - 1)
+                self._diag['per_layer_hits'][li] += len(needed_local_hit)
+                self._diag['per_layer_unique_needed'][li] += len(needed_local_hit)
+            if _nvtx:
+                _nvtx.range_pop()
+            return
+
+        # Miss detected → CPU fallback path
+        if hasattr(self, '_diag'):
+            self._diag['eager_boundary_misses'] += 1
+
+        # 1. Extract needed experts from fresh routing (GPU → CPU)
+        unique_global = valid_ids.unique().cpu().tolist()
+        needed_global = {int(g) for g in unique_global if g >= 0}
+        needed_local = self._globals_to_locals_cached(layer_idx, needed_global)
+
+        # 2. Hit/miss classification
+        miss_ids = []
+        cached_needed = set()
+        for lid in needed_local:
+            if self._expert_to_slot[layer_idx][lid] != -1:
+                # Hit — update access metadata
+                key = (layer_idx, lid)
+                self._access_count[key] += 1
+                self._last_access[key] = self.current_step
+                cached_needed.add(lid)
+            else:
+                miss_ids.append(lid)
+
+        # 3. Sync fetch missing experts (blocking — we're between graph pieces)
+        if miss_ids:
+            # Wait any pending async DMA from pre_step() first
+            if self._prev_needs_sync:
+                self._copy_stream.synchronize()
+                self._prev_needs_sync = False
+                self._pending_dma_slots.clear()
+
+            self._sync_fetch(layer_idx, miss_ids,
+                             protected_local_ids=cached_needed)
+
+        # 4. Update cache_map for this layer (direct GPU upload)
+        self._update_cache_map(layer_idx, layer, skip_gpu_upload=False)
+
+        # 5. Stats tracking
+        if hasattr(self, '_diag'):
+            li = min(layer_idx, self.num_layers - 1)
+            self._diag['per_layer_hits'][li] += len(cached_needed)
+            self._diag['per_layer_misses'][li] += len(miss_ids)
+            self._diag['per_layer_unique_needed'][li] += len(needed_local)
+
+        if _nvtx:
+            _nvtx.range_pop()
+
+    def inter_group_step(self, group_idx: int, layers):
+        """3-D Group boundary: previous group's fresh routing → predict next.
+
+        Called between graph pieces at group boundaries. Uses current-step
+        routing from previous group layers to predict and prefetch experts
+        for the next group.
+
+        Args:
+            group_idx: Index of the NEXT group (1-based: group 1, 2, ...)
+            layers: List of all FusedMoE layer modules
+        """
+        if not hasattr(self, '_group_ranges') or not self._group_ranges:
+            return
+
+        _nvtx = torch.cuda.nvtx if hasattr(torch.cuda, 'nvtx') else None
+        if _nvtx:
+            _nvtx.range_push(f"inter_group_step_G{group_idx}")
+
+        prev_range = self._group_ranges[group_idx - 1]
+        next_range = self._group_ranges[group_idx]
+
+        # Wait any pending async DMA first
+        if self._prev_needs_sync:
+            self._copy_stream.synchronize()
+            self._prev_needs_sync = False
+            self._pending_dma_slots.clear()
+
+        # Phase A: Read fresh routing from previous group layers (GPU→CPU)
+        # These layers just executed, so _routing_snapshot has current-step data
+        prev_routing_sets = {}
+        for i in prev_range:
+            layer = layers[i]
+            if not hasattr(layer, '_routing_snapshot'):
+                continue
+            rlen = int(layer._routing_len[0].item()) if hasattr(
+                layer, '_routing_len') else 0
+            if rlen > 0:
+                snap = layer._routing_snapshot[:rlen].cpu()
+                needed_global = {int(g) for g in snap.unique().tolist()
+                                 if g >= 0}
+                needed_local = self._globals_to_locals_cached(
+                    i, needed_global)
+                prev_routing_sets[i] = needed_local
+
+        # Phase B: Predict next group routing using previous group's data
+        # Heuristic: adjacent MoE layers have correlated routing patterns.
+        # Use union of last K layers in previous group as prediction.
+        if prev_routing_sets:
+            # Use the last 4 layers of previous group (most correlated)
+            tail_layers = sorted(prev_routing_sets.keys())[-4:]
+            prediction_union = set()
+            for li in tail_layers:
+                prediction_union |= prev_routing_sets[li]
+
+            # Phase C: For each next-group layer, prefetch predicted experts
+            needs_sync = False
+            for i in next_range:
+                layer = layers[i]
+                miss_ids = []
+                cached_needed = set()
+                for lid in prediction_union:
+                    if lid < self.local_num_experts:
+                        if self._expert_to_slot[i][lid] != -1:
+                            cached_needed.add(lid)
+                        else:
+                            miss_ids.append(lid)
+
+                if miss_ids:
+                    self._async_fetch(i, miss_ids, protected=cached_needed)
+                    needs_sync = True
+
+                # Update cache_map (skip GPU upload — we'll bulk upload)
+                self._update_cache_map(i, layer, skip_gpu_upload=True)
+
+            # Bulk cache_map upload for next group layers
+            if (hasattr(self, '_stacked_scratch_gpu')
+                    and self._stacked_scratch_gpu is not None):
+                for i in next_range:
+                    self._stacked_scratch_gpu[i].copy_(
+                        self._stacked_scratch_cpu[i] if hasattr(
+                            self, '_stacked_scratch_cpu')
+                        else self._scratch_maps[i],
+                        non_blocking=True)
+                    layers[i]._cache_map.copy_(
+                        self._stacked_scratch_gpu[i], non_blocking=True)
+            else:
+                for i in next_range:
+                    layers[i]._cache_map.copy_(
+                        self._scratch_maps[i].to(layers[i]._cache_map.device))
+
+            if needs_sync:
+                self._prev_needs_sync = True
+
+        if _nvtx:
+            _nvtx.range_pop()
+
+    def force_sync_pending(self, layers):
+        """Force-sync pending DMA and rebuild cache_maps.
+
+        Called when eager fallback is triggered — must ensure missed
+        experts are visible in cache_map BEFORE the eager forward pass.
+        Without this, the eager step still sees -1 for pending slots.
+        """
+        if not self._prev_needs_sync:
+            return
+        self._copy_stream.synchronize()
+        self._prev_needs_sync = False
+        pending = self._pending_dma_slots.copy()
+        self._pending_dma_slots.clear()
+
+        if not pending:
+            return
+        # Rebuild cache_maps for layers that had pending DMA
+        active_indices = getattr(self, '_active_layer_indices', [])
+        for i in active_indices:
+            if i in pending:
+                self._update_cache_map(i, layers[i], skip_gpu_upload=False)
 
     def get_timing_summary(self) -> str:
         """Return human-readable timing summary (avg per pre_step call)."""
@@ -1136,6 +1600,14 @@ class ExpertCacheManager:
             f"  hit_rate(token-wtd): {self.stats.token_hit_rate:.4f} "
             f"(tok_hits={self.stats.token_hits}, "
             f"tok_misses={self.stats.token_misses})")
+        _nk = getattr(self, '_never_evict_k', 0)
+        _uk = getattr(self, '_union_steps_k', 1)
+        lines.append(
+            f"  phase1_mitigation: never_evict_K={_nk}, "
+            f"union_K={_uk}, "
+            f"protections={self.stats.never_evict_protections}, "
+            f"union_extras={self.stats.union_prediction_extras}, "
+            f"eager_triggers={self.stats.eager_fallback_triggers}")
         return "\n".join(lines)
 
     def get_gating_summary(self) -> str:
@@ -1263,5 +1735,174 @@ class ExpertCacheManager:
                 if self._slot_to_expert[li][s] != -1)
             lines.append(
                 f"  layer {li}: {occupied}/{self.max_resident} slots used")
+
+        # ── Phase 1 Mitigation stats ──
+        _nk = getattr(self, '_never_evict_k', 0)
+        _uk = getattr(self, '_union_steps_k', 1)
+        lines.append(f"\n[Phase 1 Mitigation]")
+        lines.append(f"  never_evict_K: {_nk}")
+        lines.append(f"  union_steps_K: {_uk}")
+        lines.append(
+            f"  eviction_protections: {self.stats.never_evict_protections}")
+        lines.append(
+            f"  union_extras_prefetched: "
+            f"{self.stats.union_prediction_extras}")
+        lines.append(
+            f"  eager_fallback_triggers: "
+            f"{self.stats.eager_fallback_triggers}")
+        # Routing history depth per sample layer
+        _rh = getattr(self, '_routing_history', None)
+        if _rh:
+            for li in sample_layers:
+                if li < self.num_layers and li < len(_rh):
+                    depth = len(_rh[li])
+                    lines.append(
+                        f"  layer {li} history depth: "
+                        f"{depth}/{_uk}")
+
+        # ── Eager Routing Boundary ──
+        eb_calls = d.get('eager_boundary_calls', 0)
+        eb_hits = d.get('eager_boundary_hits', 0)
+        eb_misses = d.get('eager_boundary_misses', 0)
+        if eb_calls > 0:
+            lines.append(f"\n[Eager Routing Boundary]")
+            lines.append(
+                f"  calls: {eb_calls}, hits: {eb_hits} "
+                f"({eb_hits/eb_calls*100:.1f}%), "
+                f"misses: {eb_misses} ({eb_misses/eb_calls*100:.1f}%)")
+            lines.append(
+                f"  execution miss rate: {eb_misses/eb_calls*100:.2f}% "
+                f"(0% = perfect eager routing)")
+
+        # ── Step-Level Churn ──
+        if 'step_loads_total' in d:
+            lines.append(f"\n[Step-Level Expert Churn]")
+            lines.append(
+                f"  total loads: {d['step_loads_total']}, "
+                f"total evicts: {d['step_evicts_total']}")
+            if steps > 0:
+                lines.append(
+                    f"  avg loads/step: {d['step_loads_total']/steps:.1f}, "
+                    f"avg evicts/step: {d['step_evicts_total']/steps:.1f}")
+            overlap_hist = d.get('step_overlap_hist', [])
+            if overlap_hist:
+                arr = np.array(overlap_hist)
+                lines.append(
+                    f"  step-to-step overlap: "
+                    f"mean={arr.mean():.3f}, min={arr.min():.3f}, "
+                    f"max={arr.max():.3f}, std={arr.std():.3f}")
+                lines.append(
+                    f"  overlap >90%: {int(np.sum(arr > 0.9))}/{len(arr)} steps "
+                    f"({np.sum(arr > 0.9)/len(arr)*100:.1f}%)")
+
+        # ── Quality Eval ──
+        lines.append(self.get_quality_summary())
+
+        return "\n".join(lines)
+
+    def get_quality_summary(self) -> str:
+        """Return quality impact summary for expert cache misses.
+
+        Includes:
+        #1 Token-layer any-miss rate (tokens with miss in any layer)
+        #2 Layer-weighted miss concentration (input/output layers weighted)
+        #3 Miss injection stats (if active)
+        """
+        if not hasattr(self, '_diag'):
+            return "\n[Quality Eval] not initialized"
+        d = self._diag
+        lines = [f"\n[Quality Eval — Expert Cache Impact]"]
+
+        # ── #1: Token-level any-miss rate ──
+        tok_total = d.get('tokens_total', 0)
+        tok_miss = d.get('tokens_with_any_miss', 0)
+        miss_layers_total = d.get('miss_layers_total', 0)
+        if tok_total > 0:
+            any_miss_pct = tok_miss / tok_total * 100
+            avg_miss_layers = miss_layers_total / tok_total
+            lines.append(f"  #1 Token-level any-miss rate:")
+            lines.append(
+                f"     {tok_miss}/{tok_total} tokens had miss in >=1 layer"
+                f" = {any_miss_pct:.1f}%")
+            lines.append(
+                f"     Avg miss-layers per token: "
+                f"{avg_miss_layers:.2f} / {self.num_layers}")
+        else:
+            # Analytical estimate from per-layer miss rates
+            lines.append(f"  #1 Token-level any-miss rate: "
+                         f"(no per-token data, analytical estimate)")
+            per_layer_all_hit_prob = 1.0
+            for li in range(self.num_layers):
+                h = d['per_layer_hits'][li]
+                m = d['per_layer_misses'][li]
+                if h + m > 0:
+                    layer_hit = h / (h + m)
+                    per_layer_all_hit_prob *= layer_hit
+            est_any_miss = (1.0 - per_layer_all_hit_prob) * 100
+            lines.append(
+                f"     Estimated: {est_any_miss:.1f}% "
+                f"(product of per-layer hit rates)")
+
+        # ── #2: Layer-weighted miss concentration ──
+        lines.append(f"  #2 Layer-weighted miss concentration:")
+        # Layer 0 = input (3.0), last layer = output (2.0), rest = 1.0
+        last_layer = self.num_layers - 1
+        total_weighted_miss = 0.0
+        total_weight = 0.0
+        worst_layer = -1
+        worst_contrib = 0.0
+        layer_contribs = []
+        for li in range(self.num_layers):
+            h = d['per_layer_hits'][li]
+            m = d['per_layer_misses'][li]
+            miss_rate = m / (h + m) if (h + m) > 0 else 0.0
+            if li == 0:
+                w = 3.0
+            elif li == last_layer:
+                w = 2.0
+            else:
+                w = 1.0
+            contrib = w * miss_rate
+            total_weighted_miss += contrib
+            total_weight += w
+            if li in (0, last_layer) or contrib > worst_contrib:
+                layer_contribs.append((li, miss_rate, w, contrib))
+            if contrib > worst_contrib:
+                worst_contrib = contrib
+                worst_layer = li
+        weighted_miss_rate = (total_weighted_miss / total_weight
+                              if total_weight > 0 else 0.0)
+        # Unweighted miss rate for comparison
+        total_h = d['per_layer_hits'].sum()
+        total_m = d['per_layer_misses'].sum()
+        unw_miss = total_m / (total_h + total_m) if (total_h + total_m) > 0 else 0.0
+        lines.append(
+            f"     Weighted miss rate: {weighted_miss_rate*100:.2f}% "
+            f"(vs unweighted {unw_miss*100:.2f}%)")
+        # Show key layers
+        for li, mr, w, c in layer_contribs:
+            tag = ""
+            if li == 0:
+                tag = " (input)"
+            elif li == last_layer:
+                tag = " (output)"
+            elif li == worst_layer:
+                tag = " (worst)"
+            lines.append(
+                f"     Layer {li}{tag}: miss={mr*100:.2f}%, "
+                f"weight={w:.1f}, contribution={c*100:.2f}%")
+
+        # ── #3: Miss injection stats ──
+        _inject_rate = getattr(self, '_inject_miss_rate', 0)
+        if _inject_rate > 0:
+            _inject_count = getattr(self, '_inject_count', 0)
+            _inject_layers = getattr(self, '_inject_miss_layers', None)
+            layers_str = ("all" if _inject_layers is None
+                          else ",".join(str(x) for x in sorted(_inject_layers)))
+            lines.append(f"  #3 Miss injection active:")
+            lines.append(
+                f"     rate={_inject_rate*100:.1f}%, "
+                f"layers={layers_str}, "
+                f"total_injected={_inject_count}")
 
         return "\n".join(lines)

@@ -407,7 +407,8 @@ class FusedMoE(CustomOp):
         if prefix in compilation_config.static_forward_context:
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
-        compilation_config.static_all_moe_layers.append(prefix)
+        if hasattr(compilation_config, 'static_all_moe_layers'):
+            compilation_config.static_all_moe_layers.append(prefix)
         self.layer_name = prefix
 
         self.enable_eplb = enable_eplb
@@ -646,6 +647,8 @@ class FusedMoE(CustomOp):
         self._expert_cache = None
         self._expert_predictor = None
         self._layer_idx = -1
+        # 3-C: Eager routing (graph boundary before expert execution)
+        self._use_eager_routing = False
 
     def set_expert_cache(self, cache, predictor, layer_idx,
                          max_num_tokens=None):
@@ -1953,6 +1956,12 @@ class FusedMoE(CustomOp):
                 if self.capture is not None:
                     self.capture(topk_ids)
 
+                # 3-C: Eager routing boundary — graph split point
+                # Reads fresh routing, loads missing experts synchronously
+                if self._use_eager_routing:
+                    topk_ids = torch.ops.vllm.eager_routing_boundary(
+                        topk_ids, self.layer_name)
+
                 final_hidden_states = self.quant_method.apply(
                     layer=self,
                     x=x,  # The type signture of this is wrong due to the hack.
@@ -2132,6 +2141,79 @@ direct_register_custom_op(
     fake_impl=moe_forward_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
+
+# ── 3-C: Eager Routing Boundary ───────────────────────────────
+# Custom op that acts as a CUDA graph splitting point.
+# When inserted between router.select_experts() and quant_method.apply(),
+# it creates a graph boundary where fresh routing can be read and
+# experts loaded synchronously (eliminating 1-step-behind prediction miss).
+#
+# Activated per-layer via layer._use_eager_routing = True
+# Controlled by env var VLLM_EXPERT_EAGER_ROUTING_LAYERS (e.g., "0" or "0,47")
+
+
+def eager_routing_boundary(topk_ids: torch.Tensor,
+                           layer_name: str) -> torch.Tensor:
+    """Graph boundary: read fresh routing → update cache → return topk_ids."""
+    ctx = get_forward_context()
+    self = get_layer_from_name(layer_name)
+    if (hasattr(self, '_expert_cache') and self._expert_cache is not None
+            and hasattr(self._expert_cache, 'pre_step_single_layer')):
+        self._expert_cache.pre_step_single_layer(
+            self._layer_idx, topk_ids, self)
+    return topk_ids
+
+
+def eager_routing_boundary_fake(topk_ids: torch.Tensor,
+                                layer_name: str) -> torch.Tensor:
+    return topk_ids
+
+
+direct_register_custom_op(
+    op_name="eager_routing_boundary",
+    op_func=eager_routing_boundary,
+    mutates_args=[],
+    fake_impl=eager_routing_boundary_fake,
+)
+
+# ── 3-D: Expert Group Boundary ────────────────────────────────
+# Custom op that acts as a CUDA graph splitting point between MoE layer
+# groups. At the boundary, previous group's fresh routing is read and
+# used to predict/prefetch experts for the next group.
+#
+# Activated via VLLM_EXPERT_GROUP_SIZE env var (e.g., 16)
+
+
+def expert_group_boundary(hidden_states: torch.Tensor,
+                          group_idx: int) -> torch.Tensor:
+    """Graph boundary between MoE layer groups.
+
+    Reads fresh routing from previous group, prefetches experts for next.
+    Returns hidden_states unchanged (pass-through).
+    """
+    # Access cache via the _layers ref stored on it during init
+    from vllm.model_executor.layers.fused_moe.expert_cache import (
+        _global_expert_cache_ref)
+    cache = _global_expert_cache_ref.get('cache')
+    layers = _global_expert_cache_ref.get('layers')
+    if cache is not None and layers is not None:
+        if hasattr(cache, 'inter_group_step'):
+            cache.inter_group_step(group_idx, layers)
+    return hidden_states
+
+
+def expert_group_boundary_fake(hidden_states: torch.Tensor,
+                               group_idx: int) -> torch.Tensor:
+    return hidden_states
+
+
+direct_register_custom_op(
+    op_name="expert_group_boundary",
+    op_func=expert_group_boundary,
+    mutates_args=[],
+    fake_impl=expert_group_boundary_fake,
+)
+
 
 # Mark the FusedMoE weight_loader as supporting MoE-specific parameters
 # to avoid expensive runtime reflection in model loading code

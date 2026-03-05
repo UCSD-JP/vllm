@@ -3503,7 +3503,19 @@ class GPUModelRunner(
                     warmup_steps = getattr(
                         self, '_expert_cache_warmup_steps', 10)
                     step = self._expert_cache.current_step
-                    if (step > warmup_steps
+                    # 3-E: Eager fallback on any miss (if enabled)
+                    eager_on_any_miss = getattr(
+                        self, '_expert_eager_on_any_miss', False)
+                    if (eager_on_any_miss
+                            and step > warmup_steps
+                            and cache_result['total_misses'] > 0):
+                        cudagraph_mode = CUDAGraphMode.NONE
+                        self._expert_cache.stats.eager_fallback_triggers += 1
+                        if step % 100 == 0:
+                            logger.info(
+                                "Expert eager-on-any-miss: misses=%d, step=%d",
+                                cache_result['total_misses'], step)
+                    elif (step > warmup_steps
                             and cache_result['miss_ratio']
                             > miss_ratio_threshold):
                         cudagraph_mode = CUDAGraphMode.NONE
@@ -3525,6 +3537,13 @@ class GPUModelRunner(
                                 cache_result['total_misses'],
                                 cache_result['total_routed'],
                                 step)
+                    # Force-sync pending DMA when eager fallback is active,
+                    # so missed experts are visible in cache_map before
+                    # the eager forward pass.
+                    if (cudagraph_mode == CUDAGraphMode.NONE
+                            and cache_result.get('has_pending_dma', False)):
+                        self._expert_cache.force_sync_pending(
+                            self._expert_cache_layers)
                     # Periodic timing summary
                     if step > 0 and step % 100 == 0:
                         summary = self._expert_cache.get_timing_summary()

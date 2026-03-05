@@ -344,7 +344,96 @@ miss expert를 다음 step에서 처리하므로 TPOT에는 거의 영향 없음
 | TPOT에 영향은? | **거의 없음**: deferred sync가 miss를 완전히 숨김 (max_res=100에서도 +0.8% only) |
 | max_res 최적값은? | 100으로도 TPOT 영향 미미. GPU 메모리 절약이 필요하면 100-200도 가능 |
 
-## 8. Code References
+## 8. Truncation Artifact 근본 원인 분석
+
+### 현상
+
+Diagnostics에서 `rlen > valid_len` (17-44%)이 관측됨. 예: batch 5 tokens일 때 `rlen=80`, `valid_len=50`.
+
+### 원인: CUDA Graph Batch Padding
+
+CUDA graph는 고정된 capture size로 실행됩니다. 실제 batch가 capture size보다 작으면 padding이 발생합니다.
+
+```
+vLLM CUDA Graph Capture Sizes: 1, 2, 4, 8, 16, 32, 64, 128, ...
+실제 batch size: 5 tokens → padded to 8 (next capture size)
+```
+
+**Write 측** (`unquantized_fused_moe_method.py:330-333`):
+```python
+flat = topk_ids.reshape(-1)                    # shape = [padded_batch × top_k]
+n = min(flat.numel(), layer._routing_snapshot.numel())
+layer._routing_snapshot[:n].copy_(flat[:n])     # padding 위치 포함
+layer._routing_len.fill_(n)                     # n = 8 × 10 = 80 (padded)
+```
+
+CUDA graph 내부에서 `topk_ids`는 `[padded_batch_size, top_k]` shape입니다.
+Index 5,6,7 (padding)의 routing ID는 **stale data** — 이전 graph 실행의 잔여값 또는 0.
+
+**Read 측** (`expert_cache.py:903-909`):
+```python
+raw_rlen = int(self._routing_len_cpu[i].item())  # 80 (padded)
+valid_len = num_tokens * top_k                    # 50 (5 × 10, unpadded)
+rlen = min(rlen, valid_len)                       # 50 → clipped!
+topk_cpu = self._routing_snap_cpu[i, :rlen]       # 처음 50개만 사용
+```
+
+`pre_step()`은 `num_tokens_unpadded`를 받아서 (`gpu_model_runner.py:3492-3494`) `valid_len`으로 clip합니다.
+
+### Data Flow Diagram
+
+```
+Scheduler                 CUDA Graph                     pre_step()
+─────────                 ──────────                     ──────────
+num_tokens = 5            padded to 8                    num_tokens = 5
+                                                         (unpadded 전달)
+                          topk_ids[8,10]
+                          ├─ [0..4]: 실제 routing        valid_len = 5×10 = 50
+                          └─ [5..7]: stale/zero (pad)
+                                                         rlen = min(80, 50) = 50
+                          _routing_len = 80              topk[:50] 만 사용 ✓
+                          _routing_snap[:80]             padding 제거됨 ✓
+```
+
+### Write 측 수정이 불가능한 이유
+
+`_routing_len.fill_(n)`은 CUDA graph-captured operation입니다.
+Graph capture 시점에 `num_tokens_unpadded`는:
+1. **Graph 내부에서 접근 불가** — graph는 고정된 tensor의 data_ptr만 참조
+2. **Step마다 변하는 값** — graph 외부에서만 갱신 가능
+
+따라서 write 측에서 valid count만 기록하는 것은 구조적으로 불가능합니다.
+
+### 현재 처리의 정확성
+
+| 항목 | 상태 | 근거 |
+|------|------|------|
+| padding data가 routing에 포함? | graph 내부에서 YES | `topk_ids` shape = padded |
+| `pre_step()`이 padding 제거? | **YES** | `rlen = min(rlen, num_tokens * top_k)` |
+| padding이 hit/miss 계산에 영향? | **NO** | clip 후 `topk_cpu[:rlen]`만 사용 |
+| padding이 eviction에 영향? | **NO** | `needed_local`은 clipped routing에서만 추출 |
+| padding이 cache_map에 영향? | **NO** | cache_map은 `needed_local` 기반으로 빌드 |
+| stale data가 다른 곳에 leak? | **NO** | `_routing_snapshot`은 pre_step()에서만 읽힘 |
+
+### Truncation %의 의미
+
+```
+truncation% = (raw_rlen - valid_len) / raw_rlen × 100
+
+실제 batch=5, padded=8:  (80-50)/80 = 37.5%
+실제 batch=4, padded=4:  (40-40)/40 = 0%     ← 정확히 capture size면 0
+실제 batch=1, padded=1:  (10-10)/10 = 0%     ← 단일 요청도 0
+```
+
+Truncation %는 `(padded - actual) / padded`에 비례하며, batch size가 두 capture size 사이의 중간일 때 최대.
+Max_res=200에서 44%로 높았던 것은 해당 시점의 batch size가 capture size 대비 크게 padded되었기 때문.
+
+### 결론
+
+**수정 불필요**. Truncation은 CUDA graph padding의 정상적 부산물이며, read 측에서 이미 올바르게 보정합니다.
+Diagnostics에서 `raw_rlen`과 `valid_len`을 모두 표시하는 것으로 투명성을 확보했습니다.
+
+## 9. Code References
 
 | Component | File | Lines |
 |-----------|------|-------|
@@ -356,5 +445,10 @@ miss expert를 다음 step에서 처리하므로 TPOT에는 거의 영향 없음
 | Eviction (LFU/LRU) | `expert_cache.py` | 411-451 |
 | pre_step v2 (CUDA graph) | `expert_cache.py` | 793-990 |
 | Deferred sync | `expert_cache.py` | 818-831 |
+| Routing snapshot write (graph) | `unquantized_fused_moe_method.py` | 328-333 |
+| Routing snapshot buffer alloc | `layer.py` | 673-688 |
+| Routing read + truncation clip | `expert_cache.py` | 903-909 |
+| pre_step caller (unpadded tokens) | `gpu_model_runner.py` | 3491-3494 |
+| CUDA graph capture sizes | `cudagraph_utils.py` | 175-203 |
 | create_weights (offload mode) | `unquantized_fused_moe_method.py` | 114-188 |
 | _init_expert_offloading | `gpu_worker.py` | 279-459 |

@@ -611,6 +611,8 @@ class CompilationConfig:
         "vllm::gdn_attention_core",
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
+        "vllm::eager_routing_boundary",
+        "vllm::expert_group_boundary",
     ]
 
     def compute_hash(self) -> str:

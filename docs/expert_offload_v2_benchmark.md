@@ -136,6 +136,268 @@ because batched MoE routing increases CUDA graph execution time.
 | t_fetch | ~6,500 | 153 | 78 | **-99%** |
 | t_deferred_sync | 4.2 | 0.7 | 0.4 | -90% |
 
+### Eager Mode vs CUDA Graph — 왜 Graph가 필수인가
+
+Eager mode에서는 매 forward pass마다 Python이 커널을 하나씩 발사한다:
+
+```
+Python:  [select_experts] → launch kernel → [routing] → launch kernel → ...
+GPU:     .........[kernel].........[kernel].........[kernel]...
+              ↑ idle gap      ↑ idle gap      ↑ idle gap
+```
+
+Qwen3-Next-80B TP2 기준 **한 step에 ~4,858개 커널**:
+- 48 MoE layers × (ATTN + FFN/MoE + OUT_PROJ) = ~144 compute groups
+- 각 group 내부: select_experts, GEMM, scatter, activation 등 다수 커널
+- 96 AllReduce calls (48 layers × 2)
+- 각 커널 launch마다 CPU→GPU 커맨드 전송 ~11us
+
+결과: CPU launch overhead만 `11us × 4,858 = 53ms`, GPU idle gap `2us × 4,858 = 10ms`.
+이것이 eager mode TPOT 90ms의 정체이며, expert offload v1이 CUDA graph 불가로 56.5ms인 이유.
+
+### CUDA Graph Replay가 실제로 하는 것
+
+**녹화 (서버 시작 시 1회)**:
+```python
+with torch.cuda.graph(cudagraph):
+    output = model.forward(dummy_input)  # 4,858개 커널 시퀀스 녹화
+```
+
+GPU가 모든 커널의 순서, 파라미터, 메모리 주소를 기록. **텐서의 data_ptr() (메모리 주소)가 고정**됨.
+
+**재생 (매 step)**:
+```python
+cudagraph.replay()  # C++ 레벨에서 단일 호출. Python 코드 실행 없음.
+```
+
+이 한 줄이 GPU에서 실행하는 전체 시퀀스:
+
+```
+GPU (단일 replay 안에서 순차 실행):
+├─ Layer 0:
+│   ├─ select_experts kernel    (topk routing, GPU-only 연산)
+│   ├─ _routing_snapshot.copy_() (다음 step용 라우팅 캡처, GPU→GPU)
+│   ├─ expert_map = _cache_map 읽기 (pre_step이 미리 써놓은 값)
+│   ├─ MoE GEMM kernel (w13[slot] × hidden_state)
+│   ├─ activation kernel (SiLU)
+│   ├─ MoE GEMM kernel (w2[slot] × intermediate)
+│   ├─ AllReduce (TP2: GPU0 ↔ GPU1 결과 합산)
+│   ├─ ATTN kernel (Q·K^T, softmax, ×V)
+│   ├─ ATTN output GEMM
+│   └─ AllReduce
+├─ Layer 1: (동일 구조)
+├─ ...
+├─ Layer 47: (동일 구조)
+└─ LM head: hidden → logits
+
+총 시간: ~5ms GPU compute + ~2ms sync overhead = ~7ms
+```
+
+핵심: 이 전체 과정에서 **Python 코드는 한 줄도 실행되지 않음**. CPU는 `replay()` 호출 후 대기.
+4,858개 커널이 GPU 내부에서 연쇄 실행되며, 변경되는 것은 **고정 메모리 주소의 데이터**뿐.
+
+### pre_step이 실제로 하는 것
+
+512개 expert 중 400개만 GPU에 상주하므로, **다음 step에서 커널이 읽을 expert 매핑 테이블**을
+graph replay 전에 미리 갱신해야 한다. 이것이 pre_step의 역할.
+
+```
+pre_step(3.7ms) 내부:
+
+Phase A — GPU→GPU gather (942us, 25.5%)
+  48 layers의 _routing_snapshot (이전 step에서 GPU가 기록한 topk_ids)을
+  stacked GPU buffer로 모음. GPU 내부 D2D copy 48회.
+
+Phase B — Bulk D2H (410us, 11.1%)
+  모아진 routing 데이터를 GPU→CPU로 한 번에 전송.
+  pinned CPU memory에 착지. 단일 stream, 단일 sync.
+
+Phase C — CPU classify (1,957us, 52.9%)
+  CPU에서 순수 Python/tensor 연산:
+  ├─ 각 layer별 "이전 step에서 어떤 expert가 라우팅됐나?" 파싱
+  ├─ hit/miss 분류: GPU slot에 있으면 hit, 없으면 miss
+  ├─ miss인 expert → async DMA 큐잉 (CPU pinned → GPU slot, copy_stream)
+  │   (78us로 큐잉만 하고 완료를 기다리지 않음)
+  └─ cache_map scratch 업데이트 (expert_id → slot_id 매핑 테이블)
+
+Phase C2 — Batched GPU upload (371us, 10.0%)
+  48개 layer의 cache_map을 pinned CPU → GPU로 한 번에 전송.
+  layer._cache_map.copy_()로 고정 메모리 주소의 값만 교체.
+  → 이후 graph replay 시 커널이 이 주소를 읽으면 새 값이 보임.
+```
+
+pre_step의 본질: **"이전 step의 라우팅 결과를 보고, 다음 step에서 커널이 읽을
+expert→slot 매핑 테이블을 미리 채워놓기"**. 1-step-behind prediction.
+
+### Overlap의 실체 — "Fully Hidden"이 의미하는 것
+
+pre_step은 CPU에서, graph replay는 GPU에서 실행. 서로 다른 하드웨어이므로 **병렬 실행** 가능.
+
+```
+시간축 →
+
+CPU thread:  [sched][───── pre_step 3.7ms ─────][graph launch][idle 3.3ms]
+                    │                            │
+                    │ (cache_map 값 갱신)          │ (replay() 호출, non-blocking)
+                    │                            ↓
+GPU default: [이전 step 마무리]──────────────────[graph replay 7.0ms──────────]
+                                                 │
+GPU copy_st: ───────[DMA 0.3ms]──→               │ (miss expert 비동기 전송)
+                                                 │
+                    ←──────────── TPOT ≈ 7.0ms ──────────────→
+```
+
+TPOT 결정 공식:
+
+```
+TPOT = max(CPU_total, GPU_graph) + sync_overhead
+
+CPU_total = sched + pre_step + post ≈ 4ms
+GPU_graph ≈ 7ms (5ms compute + 2ms overhead)
+
+TPOT = max(4ms, 7ms) + α ≈ 7ms
+```
+
+**"Fully hidden"의 의미**: pre_step이 3.7ms이든 1ms이든, `CPU_total < GPU_graph`인 한
+TPOT은 변하지 않음. GPU가 더 오래 걸리므로 CPU 쪽 시간이 완전히 "숨겨짐".
+pre_step을 0ms로 만들어도 TPOT은 여전히 ~7ms.
+
+반대로 **v5에서는 pre_step = 12.6ms** → `CPU_total ≈ 13ms > GPU_graph 7ms` → CPU가 병목.
+그래서 TPOT = 10.2ms. v5→v7로 pre_step을 12.6ms→3.7ms로 줄여서 CPU가 GPU보다
+빨라지는 전환점을 넘긴 것이 핵심 성과.
+
+### 1-Step-Behind Prediction — 왜 필요하고, 왜 동작하는가
+
+#### 문제: graph 안에서는 라우팅 결과를 볼 수 없다
+
+CUDA graph replay 중에는 Python이 실행되지 않는다. 즉 **step N에서 어떤 expert가
+라우팅됐는지를 step N 안에서 CPU가 알 수 없다**.
+
+```
+Step N의 graph replay 안:
+  select_experts(hidden_state) → topk_ids = [expert 3, 7, 42, ...]
+  ↑ 이 결과는 GPU 메모리에만 존재
+  ↑ CPU는 모름 (graph 중 Python 실행 안 됨)
+  ↑ 따라서 "expert 42가 GPU에 없으니 지금 로드하자"는 불가능
+```
+
+#### 해결: 이전 step의 라우팅으로 다음 step을 예측
+
+```
+Step N-1 (graph replay 중):
+  ├─ select_experts() → topk_ids = [3, 7, 42, 156, ...]
+  ├─ _routing_snapshot.copy_(topk_ids)  ← GPU 메모리에 기록만 해둠
+  └─ kernel(expert_map=_cache_map)      ← 이미 준비된 매핑으로 실행
+
+Step N (graph replay 전):
+  ├─ pre_step():
+  │   ├─ _routing_snapshot 읽기 (GPU→CPU)  ← Step N-1의 라우팅 결과
+  │   ├─ "step N-1에서 expert 3,7,42,156을 썼으니
+  │   │    step N에서도 비슷할 것이다" ← 예측
+  │   ├─ miss인 expert → DMA로 GPU에 로드
+  │   └─ _cache_map 갱신 (expert→slot 매핑)
+  └─ graph replay:
+      └─ kernel이 갱신된 _cache_map으로 실행
+```
+
+핵심: step N의 pre_step은 **step N-1의 라우팅**을 보고 준비. 항상 1 step 뒤.
+
+#### 예측이 틀리면 어떻게 되나
+
+Step N-1에서 expert [3, 7, 42]를 썼는데, step N에서 expert [3, 7, **99**]가 라우팅된 경우:
+
+```
+pre_step: step N-1 기반으로 expert 3, 7, 42를 GPU에 준비
+graph replay: select_experts() → expert 3, 7, 99 필요
+
+expert 3:  _cache_map[3] = slot 5  → 정상 (hit)
+expert 7:  _cache_map[7] = slot 12 → 정상 (hit)
+expert 99: _cache_map[99] = -1     → slot 없음 (miss)
+           → MoE kernel이 expert 99의 기여를 0으로 처리
+           → top-10 중 1개 expert 누락 = softmax weight의 ~10% 손실
+```
+
+Miss의 영향:
+- 해당 token의 해당 layer에서 MoE output이 ~10% 약해짐 (1/top_k)
+- **1 step만** — 다음 step의 pre_step에서 expert 99를 로드
+- Decode는 autoregressive → 다음 토큰에서 self-correct 가능
+- 48 layers 전부에서 동시에 같은 expert miss 확률은 극히 낮음
+
+#### 왜 예측이 거의 맞나 — Hit rate 98.8~100%
+
+Decode 특성상 **연속된 step의 라우팅이 매우 안정적**:
+
+```
+Step N-1: input = "The capital of France is"
+          hidden_state → routing → expert [3, 7, 42, 156, ...]
+
+Step N:   input = " Par"  (다음 토큰 1개 추가)
+          hidden_state → routing → expert [3, 7, 42, 156, ...]
+          ↑ 거의 동일 (같은 문맥, 비슷한 hidden state)
+```
+
+안정적인 이유:
+1. **문맥 연속성**: 토큰 1개 추가로 hidden state가 급변하지 않음
+2. **Expert popularity bias**: 512개 중 상위 ~21개가 대부분 차지 (entropy 47.9%)
+3. **max_resident=400**: 512개 중 400개 상주 → 어떤 expert든 이미 있을 확률 78%.
+   인기 편중 포함 시 실질 miss rate ≈ 0
+
+실측 결과:
+
+| 조건 | Hit rate | Miss/step | 설명 |
+|------|:---:|:---:|------|
+| res=300 | 98.8% | 5.7 | 48 layers × 1.2% miss |
+| res=400, cold start | 99.1% | ~2 | 초기 워밍업 중 |
+| **res=400, steady state** | **100.0%** | **0.2** | 거의 miss 없음 |
+
+#### Eager (v1) vs Predict-and-Preload (v2) Trade-off
+
+| | v1 (eager, 실시간) | v2 (predict, 1-step-behind) |
+|---|---|---|
+| 정보 시점 | **현재** step 라우팅 | **이전** step 라우팅 |
+| 정확도 | 100% | 98.8~100% |
+| CUDA graph | **불가** | **호환** |
+| TPOT | 56.5ms | **7.0ms** |
+| Miss 시 | 없음 | 해당 expert 기여 0 (1 step) |
+
+100% 정확도를 위해 56.5ms를 쓰는 것보다, 98.8% 정확도로 7.0ms를 달성하는 것이 8× 빠름.
+
+#### Miss Coverage 방안 — 진짜 100%를 원한다면
+
+**방안 A: Piecewise CUDA Graph (설계서 §2.1 Codex 제안)**
+
+select_experts()만 eager로 분리하여 실시간 라우팅을 확보:
+
+```
+A단계 (eager): 48 layers의 select_experts() 실행 → 정확한 expert 목록 확보
+               miss expert DMA fetch (동기)
+B단계 (graph): MoE kernel + ATTN + AllReduce만 replay
+```
+
+- 장점: **100% 정확도 + CUDA graph 속도**
+- 단점: full-model graph를 layer 단위로 분할 필요, 96개 추가 커널 launch (~1ms),
+  piecewise CUDA graph 인프라 구현 복잡도 높음
+
+**방안 B: Eager Fallback Threshold 강화**
+
+현재 구현에 이미 존재하는 메커니즘:
+
+```python
+# gpu_model_runner.py
+if miss_count > threshold:
+    cudagraph_mode = CUDAGraphMode.NONE  # 이번 step만 eager
+```
+
+- 현재 threshold: miss_ratio > 0.95 (거의 안 발동)
+- **miss_count > 0** 으로 변경 시: miss 발생 step만 eager로 실행 (~90ms)
+- Steady state에서 100% hit → 사실상 항상 graph mode
+- Transition 시에만 가끔 eager → 평균 TPOT 영향 미미
+
+**방안 C: Speculative Pre-fetch 확장**
+
+pre_step에서 이전 routing 외에 popularity/frequency 기반으로 추가 expert를 미리 로드.
+DMA 트래픽 증가 대신 miss rate 추가 감소. 현재 이미 100%이므로 실익 없음.
+
 ### pre_step vs CUDA Graph Overlap
 
 ```
@@ -330,6 +592,21 @@ Contiguous DMA Layout 우선순위: **LOW → SKIP**.
 
 **Comparison**: Without offload-aware loading, create_weights() would allocate
 full [512,...] tensors → ~91 GiB GPU peak → OOM on 93 GiB H100.
+
+## Miss Mitigation — 100% Hit Rate 달성 방안
+
+**실측 hit rate (c=16, SWE-bench, res=400)**: 99.38% (100%가 아님). 상세 분석 및 설계:
+
+- 실측 데이터: [`expert_cache_hit_analysis.md`](expert_cache_hit_analysis.md)
+- **Miss mitigation 설계서**: [`expert_cache_miss_mitigation.md`](expert_cache_miss_mitigation.md)
+
+권장 조합 요약:
+
+| Phase | 방안 | Hit Rate | TPOT Overhead |
+|:---:|------|:---:|:---:|
+| 1 | Never-evict + Multi-step union + Eager fallback(miss>0) | **100%** | ~+0.2ms |
+| 2 | + Layer 0 eager routing | **~99.9%+** (fallback 극소화) | +0.1ms |
+| 3 | Per-layer piecewise graph (필요 시) | **100% (구조적)** | +1.6ms |
 
 ## Remaining Optimization Opportunities
 

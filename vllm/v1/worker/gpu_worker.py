@@ -452,6 +452,11 @@ class Worker(WorkerBase):
         # Store references for pre_step() calls
         self.model_runner._expert_cache = cache
         self.model_runner._expert_cache_layers = moe_layers
+        # 3-D: Global ref for group boundary custom op
+        from vllm.model_executor.layers.fused_moe.expert_cache import (
+            _global_expert_cache_ref)
+        _global_expert_cache_ref['cache'] = cache
+        _global_expert_cache_ref['layers'] = moe_layers
         # MEDIUM-1: miss_ratio threshold for proportional fallback
         self.model_runner._expert_miss_ratio_threshold = float(
             os.environ.get("VLLM_EXPERT_MISS_RATIO_THRESHOLD", "0.95")
@@ -459,6 +464,41 @@ class Worker(WorkerBase):
         self.model_runner._expert_cache_warmup_steps = int(
             os.environ.get("VLLM_EXPERT_CACHE_WARMUP_STEPS", "10")
         )
+        self.model_runner._expert_eager_on_any_miss = (
+            os.environ.get("VLLM_EXPERT_EAGER_ON_ANY_MISS", "0") == "1"
+        )
+
+        # 3-C: Eager routing — per-layer graph boundary for fresh routing
+        eager_layers_str = os.environ.get(
+            "VLLM_EXPERT_EAGER_ROUTING_LAYERS", "")
+        if eager_layers_str:
+            if eager_layers_str.strip().lower() == "all":
+                eager_set = set(range(len(moe_layers)))
+            else:
+                eager_set = {int(x) for x in eager_layers_str.split(",")
+                             if x.strip()}
+            for layer_idx, mod in enumerate(moe_layers):
+                if layer_idx in eager_set:
+                    mod._use_eager_routing = True
+            logger.info("Expert eager routing enabled for layers: %s (%d/%d)",
+                        "all" if len(eager_set) == len(moe_layers)
+                        else sorted(eager_set),
+                        len(eager_set), len(moe_layers))
+
+        # 3-D: Grouped piecewise graphs — group boundary between MoE groups
+        group_size = int(os.environ.get("VLLM_EXPERT_GROUP_SIZE", "0"))
+        if group_size > 0:
+            num_moe = len(moe_layers)
+            cache._group_size = group_size
+            cache._group_ranges = [
+                list(range(g * group_size,
+                           min((g + 1) * group_size, num_moe)))
+                for g in range((num_moe + group_size - 1) // group_size)
+            ]
+            logger.info(
+                "Expert group boundaries: size=%d, %d groups, ranges=%s",
+                group_size, len(cache._group_ranges),
+                [(r[0], r[-1]) for r in cache._group_ranges])
 
         freed_bytes = (
             (local_E - max_res) * len(moe_layers) * cache.expert_size_bytes
