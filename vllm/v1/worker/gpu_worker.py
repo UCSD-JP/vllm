@@ -106,6 +106,7 @@ class Worker(WorkerBase):
             self.profiler = None
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        self._vmm_pool = None  # VMMPagePool, set by _init_expert_offloading
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
@@ -273,12 +274,407 @@ class Worker(WorkerBase):
             tag="weights"
         ) and set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
+        # Expert offloading init (after model loading)
+        self._init_expert_offloading()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
     def reload_weights(self) -> None:
         self.model_runner.reload_weights()
+
+    def _init_expert_offloading(self):
+        """Initialize expert weight offloading. Called after load_model().
+
+        Ported from gpusim: creates ExpertCacheManager, optionally VMMPagePool,
+        wires expert cache into FusedMoE layers, and stores references on
+        model_runner for use by elastic KV and pre_step().
+        """
+        import gc
+        import math
+
+        from vllm.model_executor.layers.fused_moe.expert_cache import (
+            ExpertCacheManager, ExpertOffloadConfig,
+        )
+        from vllm.model_executor.layers.fused_moe.expert_predictor import (
+            ExpertPredictor,
+        )
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.utils import replace_parameter
+
+        config = getattr(self.vllm_config, 'expert_offload_config', None)
+        vmm_enabled = (
+            os.environ.get("VLLM_VMM_EXPERT_POOL", "0") == "1"
+        )
+        if config is None:
+            if (os.environ.get("VLLM_EXPERT_OFFLOAD_ENABLE", "0") != "1"
+                    and not vmm_enabled):
+                return
+            config = ExpertOffloadConfig(
+                enable=True,
+                max_resident_per_layer=int(
+                    os.environ.get("VLLM_EXPERT_MAX_RESIDENT", "512")
+                ),
+            )
+        if not config.enable:
+            return
+
+        raw_model = self.model_runner.get_model()
+        moe_layers = [
+            m for _, m in raw_model.named_modules()
+            if isinstance(m, FusedMoE)
+        ]
+        if not moe_layers:
+            return
+
+        ref = moe_layers[0]
+        local_E = ref.local_num_experts
+        global_E = ref.global_num_experts
+        w13_per_expert = ref.w13_weight.shape[1:]
+        w2_per_expert = ref.w2_weight.shape[1:]
+        dtype = ref.w13_weight.dtype
+
+        max_res = config.max_resident_per_layer
+        if max_res <= 0:
+            logger.warning(
+                "max_resident_per_layer=%d invalid, clamping to 1", max_res)
+            max_res = 1
+
+        # VMM auto-fit
+        if vmm_enabled and max_res >= local_E:
+            elem_size = torch.tensor([], dtype=dtype).element_size()
+            _w13n = 1
+            for d in w13_per_expert:
+                _w13n *= d
+            _w2n = 1
+            for d in w2_per_expert:
+                _w2n *= d
+            _expert_bytes = (_w13n + _w2n) * elem_size
+            _page_gran = 2 * 1024 * 1024
+            _group_size = 1
+            for gs in range(1, 9):
+                if (gs * _expert_bytes) % _page_gran == 0:
+                    _group_size = gs
+                    break
+            _group_pages = (
+                _group_size * _expert_bytes) // _page_gran
+            _per_expert_mem = (
+                _group_pages * _page_gran) / _group_size
+            _gpu_total = torch.cuda.get_device_properties(
+                self.device).total_memory
+            _usable = _gpu_total * self.cache_config.gpu_memory_utilization
+            _non_expert = (
+                torch.cuda.memory_allocated(self.device)
+                - local_E * len(moe_layers) * _expert_bytes
+            )
+            _avail_for_experts = _usable - _non_expert - 8 * (1 << 30)
+            auto_max = int(_avail_for_experts
+                           / (_per_expert_mem * len(moe_layers)))
+            auto_max = (auto_max // _group_size) * _group_size
+            auto_max = max(_group_size, min(auto_max, local_E))
+            max_res = auto_max
+            logger.info(
+                "VMM Phase C: auto max_res=%d (expert=%dB, "
+                "group_size=%d, group_pages=%d, avail=%.1fGB)",
+                max_res, _expert_bytes, _group_size, _group_pages,
+                _avail_for_experts / (1 << 30))
+        elif vmm_enabled:
+            logger.info("VMM Phase C: max_res=%d (from config)", max_res)
+
+        if max_res >= local_E and not vmm_enabled:
+            logger.info(
+                "max_resident_per_layer=%d >= local_experts=%d, "
+                "no offloading needed", max_res, local_E)
+            return
+
+        config.max_resident_per_layer = max_res
+
+        cache = ExpertCacheManager(
+            config=config,
+            num_layers=len(moe_layers),
+            local_num_experts=local_E,
+            global_num_experts=global_E,
+            expert_w13_shape=tuple(w13_per_expert),
+            expert_w2_shape=tuple(w2_per_expert),
+            dtype=dtype,
+            device=self.device,
+        )
+        predictor = ExpertPredictor(
+            num_layers=len(moe_layers),
+            num_local_experts=local_E,
+            top_k=ref.top_k,
+        )
+        max_num_tokens_for_buffers = getattr(
+            self.model_runner, 'max_num_tokens', 4096)
+
+        used_offload_aware = False
+        for layer_idx, module in enumerate(moe_layers):
+            if hasattr(module, '_w13_cpu_store'):
+                used_offload_aware = True
+                for lid in range(local_E):
+                    is_shared = (
+                        hasattr(module, 'num_fused_shared_experts')
+                        and lid < module.num_fused_shared_experts
+                    )
+                    cache.register_expert_cpu(
+                        layer_idx, lid,
+                        module._w13_cpu_store[lid],
+                        module._w2_cpu_store[lid],
+                        is_shared=is_shared,
+                    )
+                delattr(module, '_w13_cpu_store')
+                delattr(module, '_w2_cpu_store')
+                if hasattr(module, '_offload_num_experts'):
+                    delattr(module, '_offload_num_experts')
+            else:
+                for lid in range(local_E):
+                    is_shared = (
+                        hasattr(module, 'num_fused_shared_experts')
+                        and lid < module.num_fused_shared_experts
+                    )
+                    cache.register_expert_cpu(
+                        layer_idx, lid,
+                        module.w13_weight[lid], module.w2_weight[lid],
+                        is_shared=is_shared,
+                    )
+
+                if not vmm_enabled:
+                    placeholder_w13 = torch.nn.Parameter(
+                        torch.empty(0, dtype=dtype, device='cpu'),
+                        requires_grad=False,
+                    )
+                    placeholder_w2 = torch.nn.Parameter(
+                        torch.empty(0, dtype=dtype, device='cpu'),
+                        requires_grad=False,
+                    )
+                    replace_parameter(module, "w13_weight", placeholder_w13)
+                    replace_parameter(module, "w2_weight", placeholder_w2)
+
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    new_w13 = torch.nn.Parameter(
+                        torch.empty(
+                            (max_res, *w13_per_expert), dtype=dtype,
+                            device=self.device
+                        ),
+                        requires_grad=False,
+                    )
+                    new_w2 = torch.nn.Parameter(
+                        torch.empty(
+                            (max_res, *w2_per_expert), dtype=dtype,
+                            device=self.device
+                        ),
+                        requires_grad=False,
+                    )
+                    replace_parameter(module, "w13_weight", new_w13)
+                    replace_parameter(module, "w2_weight", new_w2)
+
+            cache.register_layer(
+                layer_idx, module.w13_weight.data, module.w2_weight.data
+            )
+            module.set_expert_cache(
+                cache, layer_idx,
+                max_num_tokens=max_num_tokens_for_buffers)
+
+            if layer_idx % 8 == 0:
+                logger.info(
+                    "Offload progress: %d/%d layers, GPU alloc: %.1fGB",
+                    layer_idx + 1, len(moe_layers),
+                    torch.cuda.memory_allocated(self.device) / (1 << 30),
+                )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # ── VMM pool init (if enabled) ──
+        if vmm_enabled:
+            try:
+                from vllm.vmm_pool import VMMPagePool, is_vmm_available
+                if not is_vmm_available():
+                    logger.warning(
+                        "VLLM_VMM_EXPERT_POOL=1 but cuda-python VMM "
+                        "bindings not available. Falling back to standard.")
+                    vmm_enabled = False
+            except ImportError:
+                logger.warning(
+                    "VLLM_VMM_EXPERT_POOL=1 but vllm.vmm_pool not found. "
+                    "Falling back to standard.")
+                vmm_enabled = False
+
+        if vmm_enabled:
+            from vllm.vmm_pool import VMMPagePool
+
+            elem_size = torch.tensor([], dtype=dtype).element_size()
+            w13_numel = 1
+            for d in w13_per_expert:
+                w13_numel *= d
+            w2_numel = 1
+            for d in w2_per_expert:
+                w2_numel *= d
+            expert_slot_bytes = (w13_numel + w2_numel) * elem_size
+
+            total_expert_bytes = (
+                local_E * len(moe_layers) * expert_slot_bytes
+            )
+            gpu_total_bytes = torch.cuda.get_device_properties(
+                self.device).total_memory
+            kv_va_bytes = gpu_total_bytes
+            num_layers = len(moe_layers)
+
+            pool = VMMPagePool(
+                device_id=self.device.index,
+                expert_total_bytes=total_expert_bytes,
+                kv_max_bytes=kv_va_bytes,
+                expert_slot_bytes=expert_slot_bytes,
+                num_layers=num_layers,
+                max_slots_per_layer=local_E,
+                dtype=dtype,
+            )
+            self._vmm_pool = pool
+            cache.set_vmm_pool(pool)
+
+            w13_bytes = w13_numel * elem_size
+            w2_bytes = w2_numel * elem_size
+            pool.set_tensor_layout(w13_bytes, w2_bytes)
+
+            phase_c = os.environ.get("VLLM_VMM_PHASE_C", "0") == "1"
+            if phase_c:
+                cache._phase_c_enabled = True
+                pool._phase_c_mode = True
+                layout = "slot_aligned"
+            else:
+                layout = "tight_pack"
+
+            if layout == "slot_aligned":
+                num_groups = math.ceil(max_res / pool.group_size)
+                expected_pages_per_layer = num_groups * pool.group_pages
+            else:
+                expected_pages_per_layer = math.ceil(
+                    max_res * expert_slot_bytes / pool.page_size)
+
+            logger.info(
+                "VMM boot: layout=%s, phase_c=%s, max_res=%d, "
+                "group_size=%d, group_pages=%d, pages/layer=%d, "
+                "expert_bytes=%d, page_size=%d",
+                layout, phase_c, max_res,
+                pool.group_size, pool.group_pages,
+                expected_pages_per_layer,
+                expert_slot_bytes, pool.page_size)
+
+            for layer_idx, module in enumerate(moe_layers):
+                old_bytes = (
+                    module.w13_weight.data.nbytes
+                    + module.w2_weight.data.nbytes
+                )
+                replace_parameter(module, "w13_weight",
+                                  torch.nn.Parameter(
+                                      torch.empty(0, dtype=dtype, device='cpu'),
+                                      requires_grad=False))
+                replace_parameter(module, "w2_weight",
+                                  torch.nn.Parameter(
+                                      torch.empty(0, dtype=dtype, device='cpu'),
+                                      requires_grad=False))
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                if phase_c:
+                    n_pages = pool.allocate_and_map_layer_slot_aligned(
+                        layer_idx, max_res)
+                else:
+                    n_pages = pool.allocate_and_map_layer_tight_pack(
+                        layer_idx, max_res)
+
+                if n_pages != expected_pages_per_layer:
+                    raise RuntimeError(
+                        f"VMM layout mismatch: layer {layer_idx} got "
+                        f"{n_pages} pages, expected "
+                        f"{expected_pages_per_layer} (layout={layout})")
+
+                w13_stacked, w2_stacked = pool.get_expert_layer_tensors(
+                    layer=layer_idx,
+                    num_slots=max_res,
+                    w13_per_expert=tuple(w13_per_expert),
+                    w2_per_expert=tuple(w2_per_expert),
+                    dtype=dtype,
+                )
+                replace_parameter(module, "w13_weight",
+                                  torch.nn.Parameter(w13_stacked,
+                                                     requires_grad=False))
+                replace_parameter(module, "w2_weight",
+                                  torch.nn.Parameter(w2_stacked,
+                                                     requires_grad=False))
+                cache.register_layer(
+                    layer_idx, w13_stacked.data, w2_stacked.data)
+
+                if layer_idx % 8 == 0 or layer_idx == num_layers - 1:
+                    committed = pool.total_pages
+                    logger.info(
+                        "VMM layer %d/%d: layout=%s, mapped %d pages "
+                        "(committed=%d), GPU=%.1fGB",
+                        layer_idx + 1, num_layers, layout,
+                        n_pages, committed,
+                        torch.cuda.memory_allocated(self.device) / (1 << 30),
+                    )
+
+            total_vmm_pages = num_layers * expected_pages_per_layer
+            total_vmm_gb = total_vmm_pages * pool.page_size / (1 << 30)
+            logger.info(
+                "VMM complete: layout=%s, max_res=%d/%d, %d layers, "
+                "%d pages (%.1f GiB), pool=%s",
+                layout, max_res, local_E, num_layers,
+                total_vmm_pages, total_vmm_gb, pool.get_stats())
+
+            self.model_runner._vmm_pool = pool
+
+            cache.populate_initial_cache()
+        else:
+            cache.populate_initial_cache()
+
+        # Wire cache_map for all layers
+        for layer_idx, module in enumerate(moe_layers):
+            if hasattr(module, '_cache_map') and module._cache_map is not None:
+                cache._update_cache_map(layer_idx, module)
+
+        # Store references for pre_step() and elastic KV
+        self.model_runner._expert_cache = cache
+        self.model_runner._expert_cache_layers = moe_layers
+
+        # Memory accounting
+        if vmm_enabled and hasattr(self.model_runner, 'model_memory_usage'):
+            old_usage = self.model_runner.model_memory_usage
+            self.model_runner.model_memory_usage = (
+                torch.cuda.memory_allocated(self.device)
+            )
+            logger.info(
+                "VMM: model_memory_usage %.2fGB -> %.2fGB",
+                old_usage / (1 << 30),
+                self.model_runner.model_memory_usage / (1 << 30),
+            )
+        elif not used_offload_aware and hasattr(
+                self.model_runner, 'model_memory_usage'):
+            freed_bytes = (
+                (local_E - max_res) * len(moe_layers)
+                * cache.expert_size_bytes
+            )
+            old_usage = self.model_runner.model_memory_usage
+            self.model_runner.model_memory_usage = max(
+                0, old_usage - freed_bytes
+            )
+            logger.info(
+                "model_memory_usage adjusted: %.2fGB -> %.2fGB",
+                old_usage / (1 << 30),
+                self.model_runner.model_memory_usage / (1 << 30),
+            )
+
+        freed_bytes = (
+            (local_E - max_res) * len(moe_layers) * cache.expert_size_bytes
+        )
+        logger.info(
+            "Expert offloading: %d->%d experts/layer, "
+            "%d layers, ~%.1fGB freed",
+            local_E, max_res, len(moe_layers), freed_bytes / (1 << 30),
+        )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -684,6 +1080,287 @@ class Worker(WorkerBase):
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
+
+    # ------------------------------------------------------------------ #
+    # Elastic KV: expert → KV page conversion
+    # ------------------------------------------------------------------ #
+
+    def init_elastic_kv(self) -> None:
+        """Initialize elastic KV infrastructure.
+
+        Called from engine BEFORE KV cache init. Wires VMMPagePool and
+        ExpertCacheManager (created by _init_expert_offloading during
+        load_model) into the elastic KV 2-phase commit protocol.
+
+        Also computes _per_tensor_block_bytes from KV cache geometry
+        so that page↔block conversion is accurate.
+        """
+        from vllm.elastic_kv_config import ElasticKVConfig
+
+        config = ElasticKVConfig.from_env()
+        if not config.enable:
+            return
+
+        logger.info("Elastic KV: initializing expert → KV conversion")
+
+        # Set elastic KV flag on model_runner (enables VMM tensor path)
+        self.model_runner._elastic_kv_enabled = True
+        self._elastic_kv_config = config
+
+        # Wire references from model_runner (set by _init_expert_offloading)
+        self._vmm_pool = self.model_runner._vmm_pool
+        self._expert_cache = self.model_runner._expert_cache
+
+        if self._vmm_pool is None:
+            logger.warning(
+                "Elastic KV enabled but _vmm_pool is None. "
+                "Expert offloading may not be initialized "
+                "(need VLLM_EXPERT_OFFLOAD_ENABLE=1 or "
+                "VLLM_VMM_EXPERT_POOL=1).")
+            self.model_runner._elastic_kv_enabled = False
+            self._elastic_kv_config = None
+            return
+
+        # Fail-fast: verify that shrink is actually possible.
+        # Without this, prepare proposes groups but commit refuses
+        # to evict → assert failure at runtime.
+        if self._expert_cache is not None:
+            if not self._expert_cache._can_shrink():
+                logger.error(
+                    "Elastic KV: expert cache cannot shrink "
+                    "(phase_c=%s, max_resident=%d, local_experts=%d). "
+                    "Expand will be disabled. "
+                    "Set VLLM_VMM_PHASE_C=1 or reduce "
+                    "VLLM_EXPERT_MAX_RESIDENT.",
+                    self._expert_cache._phase_c_enabled,
+                    self._expert_cache.max_resident,
+                    self._expert_cache.local_num_experts,
+                )
+                self.model_runner._elastic_kv_enabled = False
+                self._elastic_kv_config = None
+                config.enable = False
+                return
+
+        # Compute per_tensor_block_bytes from KV cache spec.
+        # This is called before KV cache init, so we estimate from
+        # model config. The exact values will be available after
+        # _initialize_kv_caches, but we need an estimate for
+        # compute_derived(). We use the model's head geometry.
+        per_tensor = self._compute_per_tensor_block_bytes()
+        self._per_tensor_block_bytes = per_tensor
+        self.model_runner._per_tensor_block_bytes = per_tensor
+
+        # Compute derived config from VMM geometry if pool is ready
+        if self._vmm_pool is not None and per_tensor:
+            config.compute_derived(self._vmm_pool, per_tensor)
+            self._elastic_kv_config = config
+
+    def _compute_per_tensor_block_bytes(self) -> dict[int, int]:
+        """Compute bytes per KV block for each KV tensor index.
+
+        Each KV tensor stores [num_blocks, block_size, num_heads, head_size]
+        for one attention layer. The per-block bytes = block_size * num_heads
+        * head_size * dtype_size * 2 (K+V).
+        """
+        model_config = self.vllm_config.model_config
+        cache_config = self.vllm_config.cache_config
+
+        block_size = cache_config.block_size
+
+        # Get number of KV heads and head size from model config
+        hf_config = model_config.hf_config
+        num_kv_heads = getattr(hf_config, 'num_key_value_heads',
+                               getattr(hf_config, 'num_attention_heads', 1))
+        head_dim = getattr(hf_config, 'head_dim',
+                           getattr(hf_config, 'hidden_size', 4096)
+                           // getattr(hf_config, 'num_attention_heads', 1))
+        num_layers = getattr(hf_config, 'num_hidden_layers', 1)
+
+        # Account for TP sharding
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        kv_heads_per_rank = max(1, num_kv_heads // tp_size)
+
+        dtype_size = model_config.dtype.itemsize if hasattr(
+            model_config.dtype, 'itemsize') else 2  # default bf16
+
+        # Per block: block_size tokens × kv_heads × head_dim × dtype × 2(K+V)
+        per_block_bytes = (
+            block_size * kv_heads_per_rank * head_dim * dtype_size * 2
+        )
+
+        # One entry per attention layer
+        return {i: per_block_bytes for i in range(num_layers)}
+
+    def get_elastic_kv_config(self):
+        """Return computed ElasticKVConfig for engine to pass to scheduler."""
+        return getattr(self, '_elastic_kv_config', None)
+
+    def update_elastic_kv_geometry(self, kv_cache_config) -> None:
+        """Replace HF-estimated per_tensor_block_bytes with actual values.
+
+        Called after _initialize_kv_caches() provides real KVCacheTensor sizes.
+        per_block = KVCacheTensor.size // num_blocks (exact, no estimation).
+        """
+        if not getattr(self, '_elastic_kv_config', None):
+            return
+
+        num_blocks = kv_cache_config.num_blocks
+        if num_blocks <= 0:
+            return
+
+        per_tensor = {
+            idx: t.size // num_blocks
+            for idx, t in enumerate(kv_cache_config.kv_cache_tensors)
+        }
+
+        old = self._per_tensor_block_bytes
+        self._per_tensor_block_bytes = per_tensor
+        self.model_runner._per_tensor_block_bytes = per_tensor
+
+        # Re-run compute_derived with exact geometry
+        if self._vmm_pool is not None and per_tensor:
+            self._elastic_kv_config.compute_derived(
+                self._vmm_pool, per_tensor)
+
+        logger.info(
+            "Elastic KV geometry updated: %d tensors, "
+            "old=%s, new=%s",
+            len(per_tensor),
+            {k: v for k, v in list(old.items())[:3]} if old else None,
+            {k: v for k, v in list(per_tensor.items())[:3]},
+        )
+
+    def elastic_kv_prepare(
+        self, min_blocks: int, max_blocks: int
+    ) -> dict:
+        """Phase 1: report possible expansion without side effects.
+
+        Dynamic groups: calculates required expert groups from min_blocks
+        instead of using a fixed eviction count (groups_per_expand).
+
+        The engine collects proposals from all ranks and takes the min.
+
+        Args:
+            min_blocks: Minimum KV blocks the scheduler needs.
+            max_blocks: Maximum KV blocks the scheduler could use.
+
+        Returns:
+            Dict with "possible_blocks" and "groups_to_evict".
+        """
+        import math
+        from vllm.vmm_pool import max_blocks_for_pages, pages_for_blocks
+
+        pool = self._vmm_pool
+        cache = self._expert_cache
+        per_tensor = self._per_tensor_block_bytes
+        cfg = self._elastic_kv_config
+
+        if pool is None or cache is None:
+            return {"possible_blocks": 0, "groups_to_evict": 0}
+
+        free_pages = pool.num_free_pages
+
+        # Dynamic groups: compute pages needed for min_blocks
+        pages_for_min = pages_for_blocks(
+            min_blocks, per_tensor, pool.page_size)
+        pages_needed = max(0, pages_for_min - free_pages)
+
+        if pages_needed == 0:
+            # Free pages alone are sufficient — no eviction needed
+            possible = max_blocks_for_pages(
+                free_pages, per_tensor, pool.page_size)
+            possible = min(possible, max_blocks)
+            return {"possible_blocks": possible, "groups_to_evict": 0}
+
+        # Calculate expert groups to evict
+        group_pages = pool.group_pages
+        groups_needed = math.ceil(pages_needed / group_pages)
+        # Round up to quantum (expand_group_quantum) for efficiency
+        quantum = cfg.expand_group_quantum
+        groups_planned = ((groups_needed + quantum - 1) // quantum) * quantum
+
+        evictable_groups = cache.count_evictable_groups()
+        groups_to_evict = min(groups_planned, evictable_groups)
+
+        evict_pages = groups_to_evict * group_pages
+        total_pages = free_pages + evict_pages
+        possible = max_blocks_for_pages(
+            total_pages, per_tensor, pool.page_size)
+        possible = min(possible, max_blocks)
+
+        return {"possible_blocks": possible, "groups_to_evict": groups_to_evict}
+
+    def elastic_kv_commit(self, agreed_blocks: int) -> dict:
+        """Phase 2: execute agreed expansion (shrink experts + map KV).
+
+        All ranks MUST expand exactly agreed_blocks or 0 (no partial).
+        Partial would cause rank divergence: some ranks map more physical
+        pages than the scheduler tracks as logical blocks → memory leak.
+        """
+        from vllm.vmm_pool import max_blocks_for_pages, pages_for_blocks
+
+        pool = self._vmm_pool
+        cache = self._expert_cache
+        per_tensor = self._per_tensor_block_bytes
+
+        self._last_commit_added = 0  # track for rollback
+
+        if agreed_blocks <= 0 or pool is None or cache is None:
+            return {"added_blocks": 0, "freed_pages": 0, "groups_evicted": 0}
+
+        # How many pages do we need for agreed_blocks?
+        pages_needed = pages_for_blocks(agreed_blocks, per_tensor, pool.page_size)
+        free_pages = pool.num_free_pages
+        groups_evicted = 0
+        freed_pages = 0
+
+        if free_pages < pages_needed:
+            # Evict experts to free pages
+            shortfall = pages_needed - free_pages
+            freed_pages, groups_evicted = cache.shrink_for_pages(shortfall)
+
+            # Verify: evict frees exactly group_pages per group,
+            # no interleaving allocation between prepare and commit.
+            total_available = pool.num_free_pages
+            assert total_available >= pages_needed, (
+                f"elastic_kv_commit: free_pages={total_available} < "
+                f"pages_needed={pages_needed} after evicting "
+                f"{groups_evicted} groups ({freed_pages} pages). "
+                f"This should not happen: each group frees exactly "
+                f"group_pages, and no allocation runs between "
+                f"prepare and commit."
+            )
+
+        # Map exactly agreed_blocks worth of KV pages
+        added = pool.expand_kv_physical_pages(agreed_blocks, per_tensor)
+        assert added == agreed_blocks, (
+            f"expand_kv_physical_pages returned {added}, expected "
+            f"{agreed_blocks}. free_pages was verified sufficient above."
+        )
+
+        self._last_commit_added = added
+        return {"added_blocks": added, "freed_pages": freed_pages,
+                "groups_evicted": groups_evicted}
+
+    def elastic_kv_rollback(self, n_blocks: int) -> dict:
+        """Undo this rank's last successful expand_kv_physical_pages.
+
+        Called by engine when commit diverges across ranks. Each rank
+        rolls back only what it actually expanded (not the argument),
+        so ranks that expanded 0 are no-ops.
+        """
+        pool = self._vmm_pool
+        per_tensor = self._per_tensor_block_bytes
+        actual = getattr(self, '_last_commit_added', 0)
+
+        if actual <= 0 or pool is None:
+            return {"rolled_back": 0}
+
+        rolled = pool.contract_kv_physical_pages(actual, per_tensor)
+        self._last_commit_added = 0
+        logger.info("elastic_kv_rollback: %d blocks (requested %d)",
+                     rolled, n_blocks)
+        return {"rolled_back": rolled}
 
     def _eplb_before_scale_down(self, old_ep_size: int, new_ep_size: int) -> None:
         from vllm.distributed.parallel_state import get_ep_group

@@ -18,6 +18,56 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+# ------------------------------------------------------------------ #
+# Prefix protection data types
+# ------------------------------------------------------------------ #
+
+@dataclass
+class AllocationPlan:
+    """Describes the exact deficit and protection judgment for an allocation.
+
+    Attributes:
+        required_blocks: Number of blocks needed (from coordinator).
+        total_free: Total free blocks in pool (cached + uncached).
+        noncached_free: Free blocks with NO cached prefix hash.
+    """
+
+    required_blocks: int
+    total_free: int
+    noncached_free: int
+
+    @property
+    def allocation_gap(self) -> int:
+        """Total free block deficit (need expand to satisfy at all)."""
+        return max(0, self.required_blocks - self.total_free)
+
+    @property
+    def protection_gap(self) -> int:
+        """Uncached free block deficit (prefix protection expand target)."""
+        return max(0, self.required_blocks - self.noncached_free)
+
+    @property
+    def would_touch_cached(self) -> bool:
+        """Whether this allocation would evict cached prefix blocks."""
+        return self.required_blocks > self.noncached_free
+
+
+@dataclass
+class AllocationAttempt:
+    """Result of try_allocate(): blocks + plan together.
+
+    Bundles the allocation result with the plan computed inside
+    allocate_slots(), so the caller gets explicit plan info.
+
+    Attributes:
+        blocks: Allocated blocks, or None if allocation failed.
+        plan: The computed AllocationPlan showing deficits.
+    """
+
+    blocks: "KVCacheBlocks | None"
+    plan: AllocationPlan
+
+
 @dataclass
 class KVCacheBlocks:
     """
@@ -213,6 +263,7 @@ class KVCacheManager:
         num_external_computed_tokens: int = 0,
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
+        strict_uncached: bool = False,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -333,47 +384,94 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
-            # Cannot allocate new blocks
+        # Compute allocation plan (used by try_allocate wrapper).
+        total_free = self.block_pool.get_num_free_blocks()
+        noncached_free = (
+            self.block_pool.get_num_noncached_free_blocks()
+            if strict_uncached else total_free)
+        self._last_allocation_plan = AllocationPlan(
+            required_blocks=num_blocks_to_allocate,
+            total_free=total_free,
+            noncached_free=noncached_free,
+        )
+
+        # Check available blocks (strict_uncached uses noncached only)
+        available = noncached_free if strict_uncached else total_free
+        if num_blocks_to_allocate > available:
             return None
 
-        if (
-            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
-            or num_external_computed_tokens > 0
-        ):
-            # Append the new computed blocks to the request blocks until now to
-            # avoid the case where the new blocks cannot be allocated.
-            self.coordinator.allocate_new_computed_blocks(
-                request_id=request.request_id,
-                new_computed_blocks=new_computed_block_list,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=num_external_computed_tokens,
+        # Set strict uncached mode on pool before actual allocation
+        if strict_uncached:
+            self.block_pool.set_strict_uncached(True)
+        try:
+            if (
+                new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+                or num_external_computed_tokens > 0
+            ):
+                # Append the new computed blocks to the request blocks
+                # until now to avoid the case where the new blocks cannot
+                # be allocated.
+                self.coordinator.allocate_new_computed_blocks(
+                    request_id=request.request_id,
+                    new_computed_blocks=new_computed_block_list,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=num_external_computed_tokens,
+                )
+
+            new_blocks = self.coordinator.allocate_new_blocks(
+                request.request_id,
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                num_encoder_tokens,
             )
 
-        new_blocks = self.coordinator.allocate_new_blocks(
-            request.request_id,
-            num_tokens_need_slot,
-            num_tokens_main_model,
-            num_encoder_tokens,
-        )
+            # P/D: delay caching blocks if we have to recv from
+            # remote. Update state for locally cached blocks.
+            if not self.enable_caching or delay_cache_blocks:
+                return self.create_kv_cache_blocks(new_blocks)
 
-        # P/D: delay caching blocks if we have to recv from
-        # remote. Update state for locally cached blocks.
-        if not self.enable_caching or delay_cache_blocks:
+            num_tokens_to_cache = min(
+                total_computed_tokens + num_new_tokens,
+                request.num_tokens,
+            )
+            self.coordinator.cache_blocks(request, num_tokens_to_cache)
+
             return self.create_kv_cache_blocks(new_blocks)
+        finally:
+            if strict_uncached:
+                self.block_pool.set_strict_uncached(False)
 
-        # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
-        # + num_external_computed_tokens + num_new_tokens, but must exclude
-        # "non-committable" tokens (e.g., draft tokens that could be rejected).
-        # Therefore, we cap the number at `request.num_tokens`, ensuring only
-        # "finalized" tokens are cached.
-        num_tokens_to_cache = min(
-            total_computed_tokens + num_new_tokens,
-            request.num_tokens,
+    def try_allocate(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        strict_uncached: bool = False,
+        **kwargs,
+    ) -> AllocationAttempt:
+        """Allocate slots and return both the blocks and the allocation plan.
+
+        Wraps allocate_slots() and returns AllocationAttempt so the caller
+        gets explicit plan information alongside the allocation result.
+        The plan is computed inside allocate_slots() (which depends on
+        remove_skipped_blocks, new_computed_blocks, etc.) and stored in
+        _last_allocation_plan; this method forwards it to the caller.
+
+        Args:
+            request: The request to allocate slots for.
+            num_new_tokens: Number of new tokens needing allocation.
+            strict_uncached: If True, only allocate unhashed blocks.
+            **kwargs: Forwarded to allocate_slots().
+
+        Returns:
+            AllocationAttempt with blocks (or None) and plan.
+        """
+        blocks = self.allocate_slots(
+            request, num_new_tokens,
+            strict_uncached=strict_uncached, **kwargs)
+        return AllocationAttempt(
+            blocks=blocks,
+            plan=self._last_allocation_plan,
         )
-        self.coordinator.cache_blocks(request, num_tokens_to_cache)
-
-        return self.create_kv_cache_blocks(new_blocks)
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

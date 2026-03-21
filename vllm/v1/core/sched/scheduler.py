@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import math
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -263,6 +264,275 @@ class Scheduler(SchedulerInterface):
                 vllm_config=self.vllm_config,
             )
 
+    # ------------------------------------------------------------------ #
+    # Elastic KV: expert → KV expansion
+    # ------------------------------------------------------------------ #
+
+    def set_elastic_kv_handler(self, handler, config) -> None:
+        """Register elastic KV expand handler + config from engine.
+
+        Also initializes prefix protection if VLLM_PREFIX_PROTECTION_ENABLE=1.
+
+        Args:
+            handler: Callable(min_blocks, max_blocks) -> added_blocks.
+                     Implements the 2-phase commit protocol.
+            config: ElasticKVConfig with max_expand_blocks, etc.
+        """
+        self._elastic_kv_handler = handler
+        self._elastic_kv_config = config
+        self._elastic_kv_expanded_total = 0
+
+        from vllm.v1.core.prefix_protect import PrefixProtectionConfig
+        self._prefix_protection_config = PrefixProtectionConfig.from_env()
+        if self._prefix_protection_config.enable:
+            self._prefix_protection_config.block_size = self.block_size
+            logger.info(
+                "Prefix protection enabled: "
+                "Cp=%.0f µs, pages_per_block=%d, group_pages=%d",
+                self._prefix_protection_config.compute_cp(),
+                getattr(config, 'pages_per_block', 0),
+                getattr(config, 'group_pages', 0),
+            )
+
+    def _try_elastic_kv_expand(self, deficit: int) -> int:
+        """Try to expand KV cache by converting expert pages.
+
+        Returns number of blocks added (0 if expansion not possible).
+        """
+        if not hasattr(self, '_elastic_kv_handler') or deficit <= 0:
+            # [DIAG-4a] expand skipped early
+            logger.debug(
+                "[DIAG-4] expand early-exit: has_handler=%s, deficit=%d",
+                hasattr(self, '_elastic_kv_handler'), deficit,
+            )
+            return 0
+        cfg = self._elastic_kv_config
+        # Lifetime cap from min_resident_ratio
+        remaining = (cfg.max_expand_blocks - self._elastic_kv_expanded_total
+                     if cfg.max_expand_blocks > 0 else float('inf'))
+        if remaining <= 0:
+            logger.debug(
+                "[DIAG-4] expand cap exhausted: max=%d, used=%d",
+                cfg.max_expand_blocks, self._elastic_kv_expanded_total,
+            )
+            return 0
+        max_blocks = int(remaining)
+        added = self._elastic_kv_handler(deficit, max_blocks)
+        # [DIAG-4b] expand result
+        logger.debug(
+            "[DIAG-4] expand called: deficit=%d, max_blocks=%d, "
+            "added=%d, total_expanded=%d",
+            deficit, max_blocks, added,
+            self._elastic_kv_expanded_total + (added if added > 0 else 0),
+        )
+        if added > 0:
+            self.kv_cache_manager.block_pool.expand_blocks(added)
+            self._elastic_kv_expanded_total += added
+        return added
+
+    # ------------------------------------------------------------------ #
+    # Prefix protection: hard protect + elastic expand + allocate
+    # ------------------------------------------------------------------ #
+    #
+    # Terminology:
+    # ┌────────────────────┬──────────────────────────────────────────┐
+    # │ Term               │ Meaning                                  │
+    # ├────────────────────┼──────────────────────────────────────────┤
+    # │ noncached block    │ Free block with NO cached prefix hash.   │
+    # │                    │ Safe to allocate without destroying       │
+    # │                    │ prefix cache.                            │
+    # │ cached block       │ Free block WITH a cached prefix hash.    │
+    # │                    │ Evicting it destroys prefix cache entry. │
+    # │ protection_gap     │ required_blocks - noncached_free.        │
+    # │                    │ Number of additional uncached blocks      │
+    # │                    │ needed (via elastic expand) to avoid      │
+    # │                    │ touching cached blocks.                  │
+    # │ allocation_gap     │ required_blocks - total_free.            │
+    # │                    │ Total block deficit (regardless of cache).│
+    # │ Ce (eviction cost) │ Cost of reloading evicted experts.       │
+    # │ Cp (prefix cost)   │ Cost of re-prefilling destroyed prefix.  │
+    # │ strict_uncached    │ Allocation mode that only uses blocks    │
+    # │                    │ without cached hash. Never evicts prefix. │
+    # └────────────────────┴──────────────────────────────────────────┘
+
+    def _prefix_protection_try_allocate(
+        self, request, num_new_tokens, **alloc_kwargs
+    ):
+        """Prefix protection hard-protect + elastic expand + allocate.
+
+        Design principle: if Ce < Cp, NEVER silently reclaim cached prefix
+        blocks. Either satisfy from uncached + expand, or explicitly fallback.
+
+        5-step flow:
+          1. Try strict uncached-only allocation.
+          2. Read plan (explicit return, no hidden state).
+          3. Cost model: should we protect? (Ce vs Cp)
+          4. If yes: elastic expand(protection_gap) → retry strict uncached.
+          5. Fallback: normal allocation (cached reclaim allowed).
+
+        Returns:
+            KVCacheBlocks or None.
+        """
+        mgr = self.kv_cache_manager
+        prefix_protection_active = (
+            getattr(self, '_prefix_protection_config', None) is not None
+            and self._prefix_protection_config.enable
+            and hasattr(self, '_elastic_kv_handler'))
+
+        # [DIAG-1] Entry: is prefix protection active? (log once on change)
+        _prev = getattr(self, '_diag_last_pp_active', None)
+        if _prev != prefix_protection_active:
+            logger.info(
+                "[DIAG-1] _prefix_protection_try_allocate: "
+                "active=%s, has_pp_config=%s, pp_enable=%s, has_handler=%s",
+                prefix_protection_active,
+                getattr(self, '_prefix_protection_config', None) is not None,
+                getattr(getattr(self, '_prefix_protection_config', None),
+                        'enable', 'N/A'),
+                hasattr(self, '_elastic_kv_handler'),
+            )
+            self._diag_last_pp_active = prefix_protection_active
+
+        if not prefix_protection_active:
+            # Non-protected path: normal allocate → expand deficit → retry
+            attempt = mgr.try_allocate(
+                request, num_new_tokens, **alloc_kwargs)
+            if attempt.blocks is not None:
+                return attempt.blocks
+            # [DIAG-5] Non-protected path: why no expand?
+            logger.debug(
+                "[DIAG-5] non-protected alloc failed: "
+                "allocation_gap=%d, required=%d, total_free=%d, "
+                "noncached_free=%d, has_handler=%s",
+                attempt.plan.allocation_gap,
+                attempt.plan.required_blocks,
+                attempt.plan.total_free,
+                attempt.plan.noncached_free,
+                hasattr(self, '_elastic_kv_handler'),
+            )
+            if (attempt.plan.allocation_gap > 0
+                    and hasattr(self, '_elastic_kv_handler')):
+                added = self._try_elastic_kv_expand(
+                    attempt.plan.allocation_gap)
+                if added > 0:
+                    return mgr.allocate_slots(
+                        request, num_new_tokens, **alloc_kwargs)
+            return None
+
+        # --- Prefix protection path ---
+
+        # Step 1: try strict uncached-only allocation
+        attempt = mgr.try_allocate(
+            request, num_new_tokens,
+            strict_uncached=True, **alloc_kwargs)
+        if attempt.blocks is not None:
+            return attempt.blocks  # all from uncached, cached untouched
+
+        # Step 2: read plan (explicit return from try_allocate)
+        plan = attempt.plan
+        protection_gap = plan.protection_gap
+
+        # [DIAG-2] Step 1 failed → plan values
+        logger.debug(
+            "[DIAG-2] strict uncached failed: "
+            "required=%d, total_free=%d, noncached_free=%d, "
+            "protection_gap=%d, allocation_gap=%d",
+            plan.required_blocks, plan.total_free,
+            plan.noncached_free, protection_gap, plan.allocation_gap,
+        )
+
+        # Step 3: cost model — should we protect?
+        b_eff = self._compute_b_eff()
+        h_eff = self._compute_h_eff()
+        # Derive groups_to_evict estimate from runtime geometry
+        # Use pages_for_blocks() for batched rounding — linear approx
+        # (protection_gap * pages_per_block) can overestimate by up to
+        # N× when page_size >> per_tensor_block_bytes.
+        cfg = getattr(self, '_elastic_kv_config', None)
+        if (cfg is not None
+                and getattr(cfg, 'group_pages', 0) > 0
+                and getattr(cfg, 'per_tensor_block_bytes', None)
+                and getattr(cfg, 'page_size', 0) > 0):
+            from vllm.vmm_pool import pages_for_blocks
+            pages_needed = pages_for_blocks(
+                protection_gap, cfg.per_tensor_block_bytes, cfg.page_size)
+            groups_est = math.ceil(pages_needed / cfg.group_pages)
+        else:
+            groups_est = 1  # fallback if geometry unknown
+
+        ce_val = self._prefix_protection_config.compute_ce(
+            b_eff, h_eff, groups_est)
+        cp_val = self._prefix_protection_config.compute_cp(protection_gap)
+        protect = self._prefix_protection_config.should_protect(
+            b_eff, h_eff, groups_est, protection_gap)
+
+        # Break-even: groups where Ce = Cp (for diagnostics)
+        ce_per_group = (self._prefix_protection_config.compute_ce(
+            b_eff, h_eff, 1) if groups_est > 0 else 0)
+        breakeven_groups = (int(cp_val / ce_per_group)
+                            if ce_per_group > 0 else -1)
+
+        # [DIAG-3] Cost model decision
+        logger.debug(
+            "[DIAG-3] cost model: b_eff=%d, h_eff=%d, groups_est=%d, "
+            "Ce=%.1f µs, Cp=%.1f µs (gap=%d blks), "
+            "breakeven=%d groups, should_protect=%s",
+            b_eff, h_eff, groups_est, ce_val, cp_val, protection_gap,
+            breakeven_groups, protect,
+        )
+
+        if protect:
+            # Ce < Cp: expand to fill protection_gap (all-or-nothing)
+            added = self._try_elastic_kv_expand(protection_gap)
+            if added >= protection_gap:
+                # Expand succeeded — retry strict uncached-only
+                new_blocks = mgr.allocate_slots(
+                    request, num_new_tokens,
+                    strict_uncached=True, **alloc_kwargs)
+                if new_blocks is not None:
+                    return new_blocks
+
+        # Step 4-5: protection failed or Ce >= Cp → explicit fallback
+        # Normal allocation (cached reclaim allowed)
+        attempt = mgr.try_allocate(
+            request, num_new_tokens, **alloc_kwargs)
+        if attempt.blocks is not None:
+            return attempt.blocks
+
+        # Still failed → normal expand + retry
+        if attempt.plan.allocation_gap > 0:
+            added = self._try_elastic_kv_expand(
+                attempt.plan.allocation_gap)
+            if added > 0:
+                return mgr.allocate_slots(
+                    request, num_new_tokens, **alloc_kwargs)
+
+        return None
+
+    def _compute_b_eff(self) -> int:
+        """Effective batch size from running queue."""
+        return max(1, len(self.running))
+
+    def _compute_h_eff(self) -> int:
+        """Effective remaining decode steps (conservative estimate).
+
+        Uses the minimum remaining steps across running requests,
+        clamped to [h_floor, h_cap].
+        """
+        pp_cfg = getattr(self, '_prefix_protection_config', None)
+        if pp_cfg is None:
+            return 1
+        if not self.running:
+            return pp_cfg.h_floor
+        remaining = []
+        for req in self.running:
+            rem = max(1, getattr(req, 'max_tokens', 2048)
+                      - req.num_computed_tokens
+                      - getattr(req, 'num_output_tokens', 0))
+            remaining.append(rem)
+        h_raw = min(remaining)
+        return max(pp_cfg.h_floor, min(h_raw, pp_cfg.h_cap))
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -426,14 +696,15 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
+                    # Prefix protection: uses exact deficit from coordinator,
+                    # strict uncached allocation, and Ce/Cp cost model.
+                    new_blocks = self._prefix_protection_try_allocate(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
 
                     if new_blocks is not None:
-                        # The request can be scheduled.
                         break
 
                     # The request cannot be scheduled.
@@ -707,7 +978,9 @@ class Scheduler(SchedulerInterface):
                     else 0
                 )
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                # Prefix protection: uses exact deficit from coordinator,
+                # strict uncached allocation, and Ce/Cp cost model.
+                new_blocks = self._prefix_protection_try_allocate(
                     request,
                     num_new_tokens,
                     num_new_computed_tokens=num_new_local_computed_tokens,

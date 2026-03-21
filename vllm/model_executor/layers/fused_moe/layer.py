@@ -642,6 +642,13 @@ class FusedMoE(CustomOp):
         self.batched_hidden_states: torch.Tensor | None = None
         self.batched_router_logits: torch.Tensor | None = None
 
+        # Expert cache (elastic KV MVP)
+        self._expert_cache = None          # ExpertCacheManager reference
+        self._expert_cache_layer_idx = -1  # layer index for this FusedMoE
+        self._cache_map: torch.Tensor | None = None  # persistent [global_E] → slot
+        self._routing_snapshot: torch.Tensor | None = None  # topk_ids capture
+        self._routing_len: torch.Tensor | None = None  # valid routing length
+
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
     # This is called after all weight loading and post-processing, so it
@@ -661,6 +668,29 @@ class FusedMoE(CustomOp):
             self.quant_method = FusedMoEModularMethod.make(
                 self, self.quant_method, prepare_finalize, self.shared_experts
             )
+
+    def set_expert_cache(
+        self,
+        cache,       # ExpertCacheManager
+        layer_idx: int,
+        max_num_tokens: int,
+    ) -> None:
+        """Attach expert cache for elastic KV MVP.
+
+        Creates persistent buffers for cache_map, routing_snapshot,
+        and routing_len that survive CUDA graph replay.
+        """
+        self._expert_cache = cache
+        self._expert_cache_layer_idx = layer_idx
+        device = next(self.parameters()).device
+        self._cache_map = torch.full(
+            (self.global_num_experts,), -1,
+            dtype=torch.int32, device=device)
+        self._routing_snapshot = torch.zeros(
+            max_num_tokens * self.top_k,
+            dtype=torch.int32, device=device)
+        self._routing_len = torch.zeros(
+            1, dtype=torch.int32, device=device)
 
     @property
     def shared_experts(self) -> torch.nn.Module | None:
@@ -1618,7 +1648,28 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(hidden_states, router_logits)
+        result = self.forward_native(hidden_states, router_logits)
+
+        # Elastic KV: capture routing snapshot for next-step prediction.
+        # This runs inside CUDA graph — uses persistent buffers.
+        if (self._expert_cache is not None
+                and self._routing_snapshot is not None):
+            # router_logits shape: [num_tokens, num_experts]
+            # topk_ids would be computed from router_logits
+            # We capture the raw router_logits for prediction.
+            # The actual topk_ids are computed in the routing layer,
+            # but for snapshot we just need the selected expert indices.
+            # For now, capture top-k from router_logits directly.
+            num_tokens = router_logits.shape[0]
+            topk = min(self.top_k, router_logits.shape[1])
+            _, topk_ids = torch.topk(
+                router_logits, topk, dim=-1, sorted=False)
+            flat = topk_ids.flatten()
+            snap_len = min(flat.shape[0], self._routing_snapshot.shape[0])
+            self._routing_snapshot[:snap_len].copy_(flat[:snap_len])
+            self._routing_len.fill_(snap_len)
+
+        return result
 
     def forward_impl_chunked(
         self,

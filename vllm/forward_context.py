@@ -47,6 +47,11 @@ class BatchDescriptor(NamedTuple):
     """
     Whether this batch has active LoRA adapters.
     """
+    offload_active: bool = False
+    """
+    Whether expert offloading is active for this batch (elastic KV).
+    Used for dual-graph dispatch: clean graph vs offload graph.
+    """
 
     def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
         """
@@ -54,7 +59,8 @@ class BatchDescriptor(NamedTuple):
         with PIECEWISE cudagraphs (or mixed prefill-decode FA cudagraphs).
         """
         return BatchDescriptor(
-            self.num_tokens, num_reqs=None, uniform=False, has_lora=self.has_lora
+            self.num_tokens, num_reqs=None, uniform=False,
+            has_lora=self.has_lora, offload_active=self.offload_active,
         )
 
 

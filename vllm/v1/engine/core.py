@@ -108,6 +108,10 @@ class EngineCore:
 
         self.available_gpu_memory_for_kv_cache = -1
 
+        # Phase 1: init elastic KV flags on workers BEFORE KV cache creation
+        # (so VMM-backed tensor path is active during _allocate_kv_cache_tensors)
+        self._init_elastic_kv_workers()
+
         # Setup KV Caches and update CacheConfig after profiling.
         num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
             vllm_config
@@ -116,6 +120,11 @@ class EngineCore:
         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
         self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
+
+        # Update elastic KV geometry with actual kv_cache_config
+        # (init_elastic_kv ran before KV cache init with HF estimates;
+        #  now we have exact per-tensor sizes from runtime config)
+        self._update_elastic_kv_geometry(kv_cache_config)
 
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
@@ -213,6 +222,9 @@ class EngineCore:
         freeze_gc_heap()
         # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
+        # Phase 2: register elastic KV expand handler on scheduler
+        self._register_elastic_kv_handler()
+
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -275,6 +287,102 @@ class EngineCore:
             scope="local",
         )
         return num_gpu_blocks, num_cpu_blocks, scheduler_kv_cache_config
+
+    def _update_elastic_kv_geometry(self, kv_cache_config: KVCacheConfig) -> None:
+        """Update elastic KV with actual per-tensor bytes from runtime config.
+
+        init_elastic_kv() ran before KV cache init and used HF config
+        estimates.  Now we have actual KVCacheTensor.size values.
+        """
+        from vllm.elastic_kv_config import ElasticKVConfig
+
+        config = ElasticKVConfig.from_env()
+        if not config.enable:
+            return
+
+        logger.info("Elastic KV: updating geometry from actual kv_cache_config")
+        self.collective_rpc(
+            "update_elastic_kv_geometry",
+            args=(kv_cache_config,),
+        )
+
+    def _init_elastic_kv_workers(self) -> None:
+        """Phase 1: set elastic KV flags on workers before KV cache init."""
+        from vllm.elastic_kv_config import ElasticKVConfig
+
+        config = ElasticKVConfig.from_env()
+        if not config.enable:
+            return
+
+        logger.info("Elastic KV: initializing workers (phase 1, pre-KV)")
+        self.collective_rpc("init_elastic_kv")
+
+    def _register_elastic_kv_handler(self) -> None:
+        """Phase 2: register expand handler on scheduler (post-scheduler)."""
+        from vllm.elastic_kv_config import ElasticKVConfig
+
+        config = ElasticKVConfig.from_env()
+        if not config.enable:
+            return
+
+        logger.info("Elastic KV: registering expand handler (phase 2)")
+
+        # Collect computed config from workers (after compute_derived).
+        # If ANY worker returned None, elastic KV was disabled there
+        # (e.g. expert cache cannot shrink) — skip handler registration
+        # system-wide so engine/scheduler don't attempt expansions that
+        # workers cannot fulfil.
+        configs = self.collective_rpc("get_elastic_kv_config")
+        if not configs or any(c is None for c in configs):
+            logger.warning(
+                "Elastic KV disabled: at least one worker cannot "
+                "support expansion (configs=%s)",
+                [type(c).__name__ if c is not None else None
+                 for c in (configs or [])],
+            )
+            return
+        config = configs[0]
+
+        def _expand_handler(min_blocks: int, max_blocks: int) -> int:
+            # Phase 1: PREPARE — each rank reports possible blocks (no side effects)
+            proposals = self.collective_rpc(
+                "elastic_kv_prepare",
+                args=(min_blocks, max_blocks),
+            )
+            # All ranks must agree on the same number
+            agreed = min(p["possible_blocks"] for p in proposals)
+
+            if agreed < min_blocks:
+                return 0
+
+            # Commit exact target (min_blocks), not the maximum possible.
+            # This prevents over-expansion beyond what the scheduler needs.
+            target = min_blocks
+
+            # Phase 2: COMMIT — execute agreed expansion
+            results = self.collective_rpc(
+                "elastic_kv_commit",
+                args=(target,),
+            )
+            # All ranks must commit the same amount (no partial).
+            # Each rank returns agreed_blocks or 0.
+            committed = [r["added_blocks"] for r in results]
+            if len(set(committed)) != 1:
+                # Divergence: rollback ALL ranks.
+                # Each rank's rollback is idempotent (rolls back own
+                # expand; 0-block rank rolls back 0).
+                max_committed = max(committed)
+                logger.error(
+                    "elastic_kv_commit divergence: %s — rolling back %d",
+                    committed, max_committed)
+                self.collective_rpc(
+                    "elastic_kv_rollback",
+                    args=(max_committed,),
+                )
+                return 0
+            return committed[0]
+
+        self.scheduler.set_elastic_kv_handler(_expand_handler, config)
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks

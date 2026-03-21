@@ -643,6 +643,12 @@ class GPUModelRunner(
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
+        # --- Elastic KV: expert → KV page conversion ---
+        self._elastic_kv_enabled: bool = False
+        self._vmm_pool = None  # VMMPagePool, set by gpu_worker
+        self._expert_cache = None  # ExpertCacheManager, set by gpu_worker
+        self._per_tensor_block_bytes: dict[int, int] = {}  # set by gpu_worker
+
         self.mm_budget = (
             MultiModalBudget(self.vllm_config, self.mm_registry)
             if self.supports_mm_inputs
@@ -3094,6 +3100,13 @@ class GPUModelRunner(
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, use_cascade_attn or has_encoder_output
         )
+        # Dual CUDA graph: set offload_active when experts are actually
+        # evicted. Clean graph is used when all experts are resident.
+        if (hasattr(self, '_expert_cache')
+                and self._expert_cache is not None
+                and self._expert_cache.has_evicted_experts()):
+            batch_descriptor = batch_descriptor._replace(
+                offload_active=True)
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
             assert (
@@ -3139,6 +3152,12 @@ class GPUModelRunner(
                     num_tokens_padded,
                     disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
                 )
+                # Dual CUDA graph: re-apply offload_active after DP re-dispatch
+                if (hasattr(self, '_expert_cache')
+                        and self._expert_cache is not None
+                        and self._expert_cache.has_evicted_experts()):
+                    batch_descriptor = batch_descriptor._replace(
+                        offload_active=True)
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
@@ -3294,6 +3313,13 @@ class GPUModelRunner(
                 scheduler_output.preempted_req_ids
             )
 
+        # --- Elastic KV: pre_step (expert cache update, before CUDA graph) ---
+        if self._expert_cache is not None:
+            moe_layers = self._get_moe_layers()
+            self._expert_cache.pre_step(moe_layers)
+            if self._vmm_pool is not None:
+                self._vmm_pool.mark_step_start()
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
@@ -3371,6 +3397,10 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+
+            # Dual CUDA graph: offload_active axis handles graph dispatch.
+            # No eager fallback needed — dispatcher selects the correct
+            # graph variant based on offload_active in batch_desc.
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4455,6 +4485,7 @@ class GPUModelRunner(
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        forced_batch_desc: "BatchDescriptor | None" = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -4570,6 +4601,14 @@ class GPUModelRunner(
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
+
+        # Dual CUDA graph: override batch_desc with forced descriptor
+        # to preserve offload_active axis during capture.
+        if forced_batch_desc is not None:
+            assert batch_desc.num_tokens == forced_batch_desc.num_tokens, (
+                f"forced_batch_desc num_tokens mismatch: "
+                f"{batch_desc.num_tokens} vs {forced_batch_desc.num_tokens}")
+            batch_desc = forced_batch_desc
 
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = (
@@ -5134,6 +5173,7 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
                     allow_microbatching=allow_microbatching,
                     activate_lora=activate_lora,
+                    forced_batch_desc=batch_desc,
                 )
 
             # Capture run
@@ -5143,6 +5183,7 @@ class GPUModelRunner(
                 allow_microbatching=allow_microbatching,
                 activate_lora=activate_lora,
                 is_graph_capturing=True,
+                forced_batch_desc=batch_desc,
             )
         self.maybe_remove_all_loras(self.lora_config)
 
@@ -5562,6 +5603,16 @@ class GPUModelRunner(
                 is_pooling_model=self.is_pooling_model,
             )
 
+    def _get_moe_layers(self):
+        """Return list of FusedMoE layers that have expert cache attached."""
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        layers = []
+        for module in self.model.modules():
+            if isinstance(module, FusedMoE) and getattr(
+                    module, '_expert_cache', None) is not None:
+                layers.append(module)
+        return layers
+
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
@@ -5576,12 +5627,59 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
-            )
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = tensor
+
+        # --- Elastic KV: VMM-backed KV tensors with VA headroom ---
+        if (self._elastic_kv_enabled and self._vmm_pool is not None
+                and self._per_tensor_block_bytes):
+            import math
+            from vllm.elastic_kv_config import ElasticKVConfig
+            from vllm.vmm_pool import max_blocks_for_pages
+
+            config = ElasticKVConfig.from_env()
+            pool = self._vmm_pool
+            per_tensor = self._per_tensor_block_bytes
+
+            for tidx, kv_cache_tensor in enumerate(
+                    kv_cache_config.kv_cache_tensors):
+                base_size = kv_cache_tensor.size
+                # Compute VA headroom from policy cap
+                block_bytes = per_tensor.get(tidx, 0)
+                if config.max_expand_blocks > 0 and block_bytes > 0:
+                    extra_pages = math.ceil(
+                        config.max_expand_blocks * block_bytes
+                        / pool.page_size)
+                    extra_bytes = extra_pages * pool.page_size
+                else:
+                    # Fallback: use expert total / num tensors
+                    expert_total = pool.total_expert_mapped_bytes()
+                    num_tensors = len(kv_cache_config.kv_cache_tensors)
+                    extra_bytes = (expert_total // num_tensors
+                                   if num_tensors > 0 else 0)
+
+                max_size = base_size + extra_bytes
+                # Block-align max_size
+                if block_bytes > 0:
+                    max_size = (
+                        (max_size + block_bytes - 1) // block_bytes
+                    ) * block_bytes
+
+                tensor = pool.allocate_kv_tensor(tidx, base_size, max_size)
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = tensor
+
+                logger.info(
+                    "ElasticKV: KV tensor %d — base=%d, max=%d "
+                    "(extra=%d bytes VA headroom)",
+                    tidx, base_size, max_size,
+                    max_size - base_size,
+                )
+        else:
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                tensor = torch.zeros(
+                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                )
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = tensor
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:

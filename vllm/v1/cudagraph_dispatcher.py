@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from itertools import product
 
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -178,6 +179,24 @@ class CudagraphDispatcher:
                     CUDAGraphMode.FULL,
                     self._create_padded_batch_descriptor(bs, True, has_lora),
                 )
+
+        # Dual CUDA graph: register offload_active=True keys so that
+        # offload graph replay doesn't fall back to NONE.
+        # Check both env vars: expert offload or VMM pool can trigger
+        # expert eviction at runtime.
+        _offload_on = (
+            os.environ.get("VLLM_EXPERT_OFFLOAD_ENABLE", "0") == "1"
+            or os.environ.get("VLLM_VMM_EXPERT_POOL", "0") == "1"
+        )
+        if _offload_on:
+            for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
+                offload_keys = set()
+                for key in self.cudagraph_keys[mode]:
+                    offload_keys.add(key._replace(offload_active=True))
+                self.cudagraph_keys[mode].update(offload_keys)
+            logger.info(
+                "CudagraphDispatcher: registered dual keys "
+                "(offload_active=True) for expert offload")
 
         self.keys_initialized = True
 
