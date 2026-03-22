@@ -146,6 +146,7 @@ class KVCacheCoordinator(ABC):
         num_tokens: int,
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
+        alloc_mode: str = "any",
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -160,6 +161,7 @@ class KVCacheCoordinator(ABC):
                 with spec decode, it is num_tokens - num_lookahead_tokens.
             num_encoder_tokens: The number of encoder tokens for allocating
                 blocks for cross-attention.
+            alloc_mode: "uncached_only" | "uncached_then_cached" | "any"
 
         Returns:
             The new allocated blocks.
@@ -171,6 +173,7 @@ class KVCacheCoordinator(ABC):
                 if isinstance(manager, CrossAttentionManager)
                 else num_tokens,
                 num_tokens_main_model,
+                alloc_mode=alloc_mode,
             )
             for manager in self.single_type_managers
         )

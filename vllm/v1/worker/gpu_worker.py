@@ -1153,7 +1153,27 @@ class Worker(WorkerBase):
         # Compute derived config from VMM geometry if pool is ready
         if self._vmm_pool is not None and per_tensor:
             config.compute_derived(self._vmm_pool, per_tensor)
-            self._elastic_kv_config = config
+
+        # Inject Ce runtime params from expert cache / model config
+        if self._expert_cache is not None:
+            config.local_num_experts = getattr(
+                self._expert_cache, 'local_num_experts', 0)
+        if self._vmm_pool is not None:
+            config.expert_group_size = getattr(
+                self._vmm_pool, 'group_size', 0)
+        # Extract top_k and num_layers from MoE layers if available
+        moe_layers = getattr(self.model_runner, '_expert_cache_layers', None)
+        if moe_layers:
+            first_layer = moe_layers[0]
+            config.expert_top_k = getattr(first_layer, 'top_k', 0)
+            config.num_layers = len(moe_layers)
+
+        self._elastic_kv_config = config
+        logger.info(
+            "Elastic KV Ce params: E=%d, G=%d, top_k=%d, L=%d",
+            config.local_num_experts, config.expert_group_size,
+            config.expert_top_k, config.num_layers,
+        )
 
     def _compute_per_tensor_block_bytes(self) -> dict[int, int]:
         """Compute bytes per KV block for each KV tensor index.

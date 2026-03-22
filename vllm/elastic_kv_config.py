@@ -24,6 +24,13 @@ class ElasticKVConfig:
     per_tensor_block_bytes: dict[int, int] | None = None
     page_size: int = 0
 
+    # Runtime Ce params (set by worker, not from env)
+    local_num_experts: int = 0
+    expert_group_size: int = 0
+    expert_top_k: int = 0
+    num_layers: int = 0
+    c_reload_ms: float = 0.63  # default PCIe
+
     @classmethod
     def from_env(cls) -> "ElasticKVConfig":
         return cls(

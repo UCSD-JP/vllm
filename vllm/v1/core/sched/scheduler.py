@@ -282,16 +282,43 @@ class Scheduler(SchedulerInterface):
         self._elastic_kv_config = config
         self._elastic_kv_expanded_total = 0
 
+        # JSONL trace (optional)
+        import os
+        trace_path = os.environ.get("VLLM_ELASTIC_KV_TRACE", "")
+        if trace_path:
+            try:
+                self._elastic_kv_trace_file = open(trace_path, 'a')
+                logger.info("Elastic KV trace → %s", trace_path)
+            except OSError as e:
+                logger.warning("Cannot open trace file %s: %s", trace_path, e)
+                self._elastic_kv_trace_file = None
+        else:
+            self._elastic_kv_trace_file = None
+
         from vllm.v1.core.prefix_protect import PrefixProtectionConfig
         self._prefix_protection_config = PrefixProtectionConfig.from_env()
         if self._prefix_protection_config.enable:
             self._prefix_protection_config.block_size = self.block_size
+            # Propagate Ce runtime params from ElasticKVConfig
+            for attr in ('local_num_experts', 'expert_group_size',
+                         'expert_top_k', 'num_layers', 'c_reload_ms'):
+                val = getattr(config, attr, None)
+                if val is not None and val > 0:
+                    target_attr = attr
+                    if attr == 'expert_group_size':
+                        target_attr = 'group_size'
+                    elif attr == 'expert_top_k':
+                        target_attr = 'top_k'
+                    setattr(self._prefix_protection_config, target_attr, val)
             logger.info(
-                "Prefix protection enabled: "
-                "Cp=%.0f µs, pages_per_block=%d, group_pages=%d",
-                self._prefix_protection_config.compute_cp(),
-                getattr(config, 'pages_per_block', 0),
-                getattr(config, 'group_pages', 0),
+                "Prefix protection enabled: block_size=%d, "
+                "E=%d, G=%d, top_k=%d, L=%d, c_reload=%.3f ms",
+                self._prefix_protection_config.block_size,
+                self._prefix_protection_config.local_num_experts,
+                self._prefix_protection_config.group_size,
+                self._prefix_protection_config.top_k,
+                self._prefix_protection_config.num_layers,
+                self._prefix_protection_config.c_reload_ms,
             )
 
     def _try_elastic_kv_expand(self, deficit: int) -> int:
@@ -351,46 +378,41 @@ class Scheduler(SchedulerInterface):
     # │                    │ Total block deficit (regardless of cache).│
     # │ Ce (eviction cost) │ Cost of reloading evicted experts.       │
     # │ Cp (prefix cost)   │ Cost of re-prefilling destroyed prefix.  │
-    # │ strict_uncached    │ Allocation mode that only uses blocks    │
-    # │                    │ without cached hash. Never evicts prefix. │
+    # │ alloc_mode         │ "uncached_only" | "uncached_then_cached"  │
+    # │                    │ | "any" — controls which free queue to    │
+    # │                    │ pop from.                                │
     # └────────────────────┴──────────────────────────────────────────┘
 
     def _prefix_protection_try_allocate(
         self, request, num_new_tokens, **alloc_kwargs
     ):
-        """Prefix protection hard-protect + elastic expand + allocate.
+        """V3 3-way prefix protection + elastic expand + allocate.
 
-        Design principle: if Ce < Cp, NEVER silently reclaim cached prefix
-        blocks. Either satisfy from uncached + expand, or explicitly fallback.
-
-        5-step flow:
-          1. Try strict uncached-only allocation.
-          2. Read plan (explicit return, no hidden state).
-          3. Cost model: should we protect? (Ce vs Cp)
-          4. If yes: elastic expand(protection_gap) → retry strict uncached.
-          5. Fallback: normal allocation (cached reclaim allowed).
+        Decision flow:
+          1. Compute plan (uncached_only attempt for plan values).
+          2. If uncached suffices → UNCACHED_ONLY alloc → done.
+          3. Compute V3 costs (Ce, Cc, Cp) and decide().
+          4. Execute decision:
+             - PROTECT_AND_EXPAND → expand + UNCACHED_ONLY retry
+             - RECLAIM_CACHED → UNCACHED_THEN_CACHED alloc
+             - PREEMPT → return None (caller preempts)
 
         Returns:
             KVCacheBlocks or None.
         """
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+
         mgr = self.kv_cache_manager
         prefix_protection_active = (
             getattr(self, '_prefix_protection_config', None) is not None
             and self._prefix_protection_config.enable
             and hasattr(self, '_elastic_kv_handler'))
 
-        # [DIAG-1] Entry: is prefix protection active? (log once on change)
+        # Log once on state change
         _prev = getattr(self, '_diag_last_pp_active', None)
         if _prev != prefix_protection_active:
             logger.info(
-                "[DIAG-1] _prefix_protection_try_allocate: "
-                "active=%s, has_pp_config=%s, pp_enable=%s, has_handler=%s",
-                prefix_protection_active,
-                getattr(self, '_prefix_protection_config', None) is not None,
-                getattr(getattr(self, '_prefix_protection_config', None),
-                        'enable', 'N/A'),
-                hasattr(self, '_elastic_kv_handler'),
-            )
+                "prefix_protection active=%s", prefix_protection_active)
             self._diag_last_pp_active = prefix_protection_active
 
         if not prefix_protection_active:
@@ -399,17 +421,6 @@ class Scheduler(SchedulerInterface):
                 request, num_new_tokens, **alloc_kwargs)
             if attempt.blocks is not None:
                 return attempt.blocks
-            # [DIAG-5] Non-protected path: why no expand?
-            logger.debug(
-                "[DIAG-5] non-protected alloc failed: "
-                "allocation_gap=%d, required=%d, total_free=%d, "
-                "noncached_free=%d, has_handler=%s",
-                attempt.plan.allocation_gap,
-                attempt.plan.required_blocks,
-                attempt.plan.total_free,
-                attempt.plan.noncached_free,
-                hasattr(self, '_elastic_kv_handler'),
-            )
             if (attempt.plan.allocation_gap > 0
                     and hasattr(self, '_elastic_kv_handler')):
                 added = self._try_elastic_kv_expand(
@@ -419,35 +430,26 @@ class Scheduler(SchedulerInterface):
                         request, num_new_tokens, **alloc_kwargs)
             return None
 
-        # --- Prefix protection path ---
+        # --- V3 Prefix protection path ---
 
-        # Step 1: try strict uncached-only allocation
+        # Step 1: try uncached-only (also computes plan)
         attempt = mgr.try_allocate(
             request, num_new_tokens,
-            strict_uncached=True, **alloc_kwargs)
+            alloc_mode="uncached_only", **alloc_kwargs)
         if attempt.blocks is not None:
-            return attempt.blocks  # all from uncached, cached untouched
+            return attempt.blocks  # USE_UNCACHED: all from uncached
 
-        # Step 2: read plan (explicit return from try_allocate)
         plan = attempt.plan
         protection_gap = plan.protection_gap
+        touched = plan.touched_cached_blocks
 
-        # [DIAG-2] Step 1 failed → plan values
-        logger.debug(
-            "[DIAG-2] strict uncached failed: "
-            "required=%d, total_free=%d, noncached_free=%d, "
-            "protection_gap=%d, allocation_gap=%d",
-            plan.required_blocks, plan.total_free,
-            plan.noncached_free, protection_gap, plan.allocation_gap,
-        )
-
-        # Step 3: cost model — should we protect?
-        b_eff = self._compute_b_eff()
+        # Step 2: compute V3 cost inputs
         h_eff = self._compute_h_eff()
-        # Derive groups_to_evict estimate from runtime geometry
-        # Use pages_for_blocks() for batched rounding — linear approx
-        # (protection_gap * pages_per_block) can overestimate by up to
-        # N× when page_size >> per_tensor_block_bytes.
+        n_prefill = sum(1 for r in self.running
+                        if r.num_output_tokens == 0)
+        n_decode = max(1, len(self.running) - n_prefill)
+
+        # Estimate groups to evict from runtime geometry
         cfg = getattr(self, '_elastic_kv_config', None)
         if (cfg is not None
                 and getattr(cfg, 'group_pages', 0) > 0
@@ -458,80 +460,173 @@ class Scheduler(SchedulerInterface):
                 protection_gap, cfg.per_tensor_block_bytes, cfg.page_size)
             groups_est = math.ceil(pages_needed / cfg.group_pages)
         else:
-            groups_est = 1  # fallback if geometry unknown
+            groups_est = 1
 
-        ce_val = self._prefix_protection_config.compute_ce(
-            b_eff, h_eff, groups_est)
-        cp_val = self._prefix_protection_config.compute_cp(protection_gap)
-        protect = self._prefix_protection_config.should_protect(
-            b_eff, h_eff, groups_est, protection_gap)
+        # can_fully_protect: partial expand prevention.
+        # NOTE: this is a cap-based heuristic — even when True, the worker
+        # may deliver fewer blocks than requested (VMM/eviction limits).
+        # If expand under-delivers, we fall back to RECLAIM_CACHED below.
+        remaining_cap = (
+            cfg.max_expand_blocks - self._elastic_kv_expanded_total
+            if cfg is not None and cfg.max_expand_blocks > 0
+            else float('inf'))
+        can_fully_protect = (
+            hasattr(self, '_elastic_kv_handler')
+            and remaining_cap >= protection_gap)
 
-        # Break-even: groups where Ce = Cp (for diagnostics)
-        ce_per_group = (self._prefix_protection_config.compute_ce(
-            b_eff, h_eff, 1) if groups_est > 0 else 0)
-        breakeven_groups = (int(cp_val / ce_per_group)
-                            if ce_per_group > 0 else -1)
+        # Preempt cost: worst candidate (single-candidate heuristic)
+        preempt_tokens = 0
+        if self.running:
+            preempt_tokens = min(
+                r.num_computed_tokens for r in self.running)
 
-        # [DIAG-3] Cost model decision
+        # Step 3: V3 3-way decision
+        pp_cfg = self._prefix_protection_config
+        decision = pp_cfg.decide(
+            h_eff=h_eff, groups_to_evict=groups_est,
+            touched_cached_blocks=touched,
+            preempt_computed_tokens=preempt_tokens,
+            n_decode=n_decode, n_prefill=n_prefill,
+            can_fully_protect=can_fully_protect)
+
+        # Compute costs for trace/logging
+        ce_val = pp_cfg.compute_ce(h_eff, groups_est, n_decode, n_prefill)
+        cc_val = pp_cfg.compute_cc(touched)
+        cp_val = pp_cfg.compute_cp(preempt_tokens)
+
         logger.debug(
-            "[DIAG-3] cost model: b_eff=%d, h_eff=%d, groups_est=%d, "
-            "Ce=%.1f µs, Cp=%.1f µs (gap=%d blks), "
-            "breakeven=%d groups, should_protect=%s",
-            b_eff, h_eff, groups_est, ce_val, cp_val, protection_gap,
-            breakeven_groups, protect,
+            "pp_decide: decision=%s, required=%d, uncached=%d, cached=%d, "
+            "touched=%d, h_eff=%d, groups=%d, Ce=%.0f Cc=%.0f Cp=%.0f, "
+            "can_protect=%s, remaining_cap=%.0f",
+            decision.value, plan.required_blocks, plan.noncached_free,
+            plan.cached_free, touched, h_eff, groups_est,
+            ce_val, cc_val, cp_val,
+            can_fully_protect, remaining_cap,
         )
 
-        if protect:
-            # Ce < Cp: expand to fill protection_gap (all-or-nothing)
+        # JSONL trace (if enabled)
+        self._trace_decision(
+            plan=plan, h_eff=h_eff, groups_est=groups_est,
+            n_decode=n_decode, n_prefill=n_prefill,
+            ce=ce_val, cc=cc_val, cp=cp_val,
+            can_fully_protect=can_fully_protect,
+            remaining_cap=remaining_cap,
+            decision=decision, preempt_tokens=preempt_tokens,
+        )
+
+        # Step 4: execute decision
+        if decision == ProtectionDecision.PROTECT_AND_EXPAND:
             added = self._try_elastic_kv_expand(protection_gap)
             if added >= protection_gap:
-                # Expand succeeded — retry strict uncached-only
+                # Retry uncached-only after expand
                 new_blocks = mgr.allocate_slots(
                     request, num_new_tokens,
-                    strict_uncached=True, **alloc_kwargs)
+                    alloc_mode="uncached_only", **alloc_kwargs)
                 if new_blocks is not None:
                     return new_blocks
+            # Expand insufficient (worker under-delivered) →
+            # fallback to RECLAIM_CACHED.  This is expected when VMM or
+            # expert eviction limits prevent full expand.
+            logger.warning(
+                "pp: expand partial (%d/%d), fallback to reclaim_cached",
+                added, protection_gap)
+            decision = ProtectionDecision.RECLAIM_CACHED
 
-        # Step 4-5: protection failed or Ce >= Cp → explicit fallback
-        # Normal allocation (cached reclaim allowed)
-        attempt = mgr.try_allocate(
-            request, num_new_tokens, **alloc_kwargs)
-        if attempt.blocks is not None:
-            return attempt.blocks
+        if decision == ProtectionDecision.RECLAIM_CACHED:
+            # Uncached first, then cached for remainder
+            attempt = mgr.try_allocate(
+                request, num_new_tokens,
+                alloc_mode="uncached_then_cached", **alloc_kwargs)
+            if attempt.blocks is not None:
+                return attempt.blocks
+            # Still failed → try expand for allocation gap
+            if attempt.plan.allocation_gap > 0:
+                added = self._try_elastic_kv_expand(
+                    attempt.plan.allocation_gap)
+                if added > 0:
+                    return mgr.allocate_slots(
+                        request, num_new_tokens,
+                        alloc_mode="uncached_then_cached", **alloc_kwargs)
+            return None
 
-        # Still failed → normal expand + retry
-        if attempt.plan.allocation_gap > 0:
-            added = self._try_elastic_kv_expand(
-                attempt.plan.allocation_gap)
-            if added > 0:
-                return mgr.allocate_slots(
-                    request, num_new_tokens, **alloc_kwargs)
-
+        # PREEMPT: return None → caller's preemption loop handles it
         return None
+
+    def _trace_decision(self, **kwargs) -> None:
+        """Write JSONL trace line if VLLM_ELASTIC_KV_TRACE is set."""
+        trace_file = getattr(self, '_elastic_kv_trace_file', None)
+        if trace_file is None:
+            return
+        import json
+        import time
+        plan = kwargs.pop('plan')
+        record = {
+            'ts': time.time(),
+            'required_blocks': plan.required_blocks,
+            'uncached_free': plan.noncached_free,
+            'cached_free': plan.cached_free,
+            'touched_cached_blocks': plan.touched_cached_blocks,
+            'protection_gap': plan.protection_gap,
+            'allocation_gap': plan.allocation_gap,
+            'expanded_total': getattr(self, '_elastic_kv_expanded_total', 0),
+        }
+        record['h_eff'] = kwargs.get('h_eff', 0)
+        record['groups_est'] = kwargs.get('groups_est', 0)
+        record['n_decode'] = kwargs.get('n_decode', 0)
+        record['n_prefill'] = kwargs.get('n_prefill', 0)
+        record['Ce'] = kwargs.get('ce', 0)
+        record['Cc'] = kwargs.get('cc', 0)
+        record['Cp'] = kwargs.get('cp', 0)
+        record['can_fully_protect'] = kwargs.get('can_fully_protect', False)
+        record['remaining_cap'] = kwargs.get('remaining_cap', 0)
+        decision = kwargs.get('decision')
+        record['decision'] = decision.value if decision else ''
+        record['preempt_tokens'] = kwargs.get('preempt_tokens', 0)
+        # Runtime config for accurate offline replay
+        pp_cfg = getattr(self, '_prefix_protection_config', None)
+        if pp_cfg is not None:
+            record['cfg'] = {
+                'E': pp_cfg.local_num_experts,
+                'G': pp_cfg.group_size,
+                'top_k': pp_cfg.top_k,
+                'c_reload_ms': pp_cfg.c_reload_ms,
+                'block_size': pp_cfg.block_size,
+                'h_cap': pp_cfg.h_cap,
+                'num_layers': pp_cfg.num_layers,
+                'l_sync_prefill': pp_cfg.l_sync_prefill,
+                't_recompute': pp_cfg.t_recompute_ms_per_token,
+                't_prefill_tok_us': pp_cfg.t_prefill_tok_us,
+                'p_reuse': pp_cfg.p_reuse,
+            }
+        try:
+            trace_file.write(json.dumps(record) + '\n')
+            trace_file.flush()
+        except Exception:
+            pass  # trace is best-effort
 
     def _compute_b_eff(self) -> int:
         """Effective batch size from running queue."""
         return max(1, len(self.running))
 
     def _compute_h_eff(self) -> int:
-        """Effective remaining decode steps (conservative estimate).
+        """V3 H_eff: min remaining decode steps over running requests.
 
-        Uses the minimum remaining steps across running requests,
-        clamped to [h_floor, h_cap].
+        H_eff = min(H_cap, min_over_running(max_tokens - num_output_tokens))
+        Clamped to [1, h_cap].
         """
         pp_cfg = getattr(self, '_prefix_protection_config', None)
         if pp_cfg is None:
             return 1
+        h_cap = pp_cfg.h_cap
         if not self.running:
-            return pp_cfg.h_floor
-        remaining = []
+            return 1
+        h_min = h_cap
         for req in self.running:
-            rem = max(1, getattr(req, 'max_tokens', 2048)
-                      - req.num_computed_tokens
-                      - getattr(req, 'num_output_tokens', 0))
-            remaining.append(rem)
-        h_raw = min(remaining)
-        return max(pp_cfg.h_floor, min(h_raw, pp_cfg.h_cap))
+            max_tok = getattr(req, 'max_tokens', 0) or 0
+            if max_tok > 0:
+                left = max_tok - getattr(req, 'num_output_tokens', 0)
+                h_min = min(h_min, left)
+        return max(1, min(h_min, h_cap))
 
     def _mamba_block_aligned_split(
         self,

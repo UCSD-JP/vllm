@@ -471,3 +471,195 @@ class TestEngineFailFastPropagation:
             registered = False
 
         assert registered is True
+
+
+# ---------------------------------------------------------------------------
+# BlockPool 2-queue tests
+# ---------------------------------------------------------------------------
+
+class TestBlockPoolTwoQueue:
+    """Tests for BlockPool split free queue (uncached + cached)."""
+
+    def _make_pool(self, num_blocks=21):
+        from vllm.v1.core.block_pool import BlockPool
+        return BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=True,
+            hash_block_size=16,
+        )
+
+    def _move_to_cached(self, pool, count):
+        """Pop from uncached, set hash, put in cached queue."""
+        blocks = pool.free_uncached_queue.popleft_n(count)
+        for i, b in enumerate(blocks):
+            b._block_hash = b'hash' + i.to_bytes(4, 'big')
+        pool.free_cached_queue.append_n(blocks)
+        return blocks
+
+    def test_initial_state_all_uncached(self):
+        """At init, all free blocks are in uncached queue."""
+        pool = self._make_pool(21)
+        # 1 null block consumed
+        assert pool.get_num_noncached_free_blocks() == 20
+        assert pool.get_num_cached_free_blocks() == 0
+        assert pool.get_num_free_blocks() == 20
+
+    def test_free_blocks_routing_by_hash(self):
+        """free_blocks() routes to correct queue based on block_hash."""
+        pool = self._make_pool(21)
+        # Get 4 blocks
+        blocks = pool.get_new_blocks(4)
+        assert len(blocks) == 4
+        # Set hash on 2 of them (simulating cache_full_blocks)
+        blocks[0]._block_hash = b'hash0'
+        blocks[1]._block_hash = b'hash1'
+        # Free all — 2 should go to cached, 2 to uncached
+        pool.free_blocks(reversed(blocks))
+        assert pool.get_num_cached_free_blocks() == 2
+        # uncached: 16 remaining + 2 freed = 18
+        assert pool.get_num_noncached_free_blocks() == 18
+
+    def test_touch_removes_from_correct_queue(self):
+        """touch() removes cached block from cached queue."""
+        pool = self._make_pool(21)
+        cached_blocks = self._move_to_cached(pool, 3)
+        assert pool.get_num_cached_free_blocks() == 3
+
+        # Touch one cached block (simulating prefix hit)
+        pool.touch([cached_blocks[0]])
+        assert pool.get_num_cached_free_blocks() == 2
+        assert cached_blocks[0].ref_cnt == 1
+
+    def test_reset_prefix_cache_drains_cached_queue(self):
+        """reset_prefix_cache() moves all cached→uncached."""
+        pool = self._make_pool(21)
+        self._move_to_cached(pool, 8)
+        assert pool.get_num_cached_free_blocks() == 8
+
+        result = pool.reset_prefix_cache()
+        assert result is True
+        assert pool.get_num_cached_free_blocks() == 0
+        assert pool.get_num_free_blocks() == 20  # all free
+
+    def test_expand_blocks_go_to_uncached(self):
+        """expand_blocks() adds to uncached queue."""
+        pool = self._make_pool(21)
+        initial_uncached = pool.get_num_noncached_free_blocks()
+        pool.expand_blocks(5)
+        assert pool.get_num_noncached_free_blocks() == initial_uncached + 5
+        assert pool.get_num_cached_free_blocks() == 0
+
+    def test_alloc_mode_uncached_then_cached(self):
+        """uncached_then_cached: exhaust uncached first, then cached."""
+        pool = self._make_pool(21)
+        self._move_to_cached(pool, 10)
+        # Now: 10 uncached, 10 cached
+
+        # Request 15 blocks with uncached_then_cached
+        blocks = pool.get_new_blocks(15, alloc_mode="uncached_then_cached")
+        assert len(blocks) == 15
+        # All 10 uncached used + 5 from cached
+        assert pool.get_num_noncached_free_blocks() == 0
+        assert pool.get_num_cached_free_blocks() == 5
+
+    def test_alloc_mode_any(self):
+        """any mode: takes from uncached first, then cached."""
+        pool = self._make_pool(21)
+        self._move_to_cached(pool, 5)
+        # 15 uncached, 5 cached
+
+        blocks = pool.get_new_blocks(18, alloc_mode="any")
+        assert len(blocks) == 18
+        assert pool.get_num_free_blocks() == 2
+
+    def test_maybe_evict_moves_free_cached_to_uncached(self):
+        """_maybe_evict_cached_block on a free block in cached queue
+        should move it to uncached queue."""
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash, make_block_hash_with_group_id)
+        pool = self._make_pool(21)
+
+        # Manually create 3 cached blocks with proper hash format
+        raw_blocks = pool.free_uncached_queue.popleft_n(3)
+        for i, b in enumerate(raw_blocks):
+            raw_hash = BlockHash(b'hash' + i.to_bytes(4, 'big'))
+            full_hash = make_block_hash_with_group_id(raw_hash, 0)
+            b._block_hash = full_hash
+            pool.cached_block_hash_to_block.insert(full_hash, b)
+        pool.free_cached_queue.append_n(raw_blocks)
+
+        assert pool.get_num_cached_free_blocks() == 3
+        initial_uncached = pool.get_num_noncached_free_blocks()
+
+        # Evict one block (free, ref_cnt==0, in cached queue)
+        pool._maybe_evict_cached_block(raw_blocks[0])
+        assert pool.get_num_cached_free_blocks() == 2
+        assert pool.get_num_noncached_free_blocks() == initial_uncached + 1
+
+    def test_migration_shim_alias(self):
+        """free_block_queue alias points to free_uncached_queue."""
+        pool = self._make_pool(21)
+        assert pool.free_block_queue is pool.free_uncached_queue
+
+
+# ---------------------------------------------------------------------------
+# ElasticKVConfig Ce runtime params
+# ---------------------------------------------------------------------------
+
+class TestAllocationPlanTouchedClamp:
+    """Finding 1: touched_cached_blocks clamped to cached_free."""
+
+    def test_touched_clamped_to_cached_free(self):
+        """required=40, noncached=5, cached=10 → touched=10 (not 35)."""
+        from vllm.v1.core.kv_cache_manager import AllocationPlan
+        plan = AllocationPlan(
+            required_blocks=40,
+            total_free=15,
+            noncached_free=5,
+            cached_free=10,
+        )
+        assert plan.touched_cached_blocks == 10  # min(35, 10)
+        assert plan.protection_gap == 35  # unclamped
+
+    def test_touched_when_cached_sufficient(self):
+        """required=20, noncached=5, cached=20 → touched=15."""
+        from vllm.v1.core.kv_cache_manager import AllocationPlan
+        plan = AllocationPlan(
+            required_blocks=20,
+            total_free=25,
+            noncached_free=5,
+            cached_free=20,
+        )
+        assert plan.touched_cached_blocks == 15  # min(15, 20) = 15
+
+    def test_touched_zero_when_uncached_sufficient(self):
+        """required=5, noncached=10 → touched=0."""
+        from vllm.v1.core.kv_cache_manager import AllocationPlan
+        plan = AllocationPlan(
+            required_blocks=5,
+            total_free=20,
+            noncached_free=10,
+            cached_free=10,
+        )
+        assert plan.touched_cached_blocks == 0
+
+
+class TestElasticKVConfigCeParams:
+    """Tests for runtime Ce parameter fields."""
+
+    def test_ce_params_default_zero(self):
+        from vllm.elastic_kv_config import ElasticKVConfig
+        cfg = ElasticKVConfig()
+        assert cfg.local_num_experts == 0
+        assert cfg.expert_group_size == 0
+        assert cfg.expert_top_k == 0
+        assert cfg.num_layers == 0
+        assert cfg.c_reload_ms == 0.63
+
+    def test_ce_params_from_env_not_set(self):
+        """from_env() should not read Ce params from env."""
+        from vllm.elastic_kv_config import ElasticKVConfig
+        cfg = ElasticKVConfig.from_env()
+        # Ce params are runtime-only, should be 0
+        assert cfg.local_num_experts == 0
+        assert cfg.expert_top_k == 0

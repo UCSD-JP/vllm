@@ -160,10 +160,16 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # Split free queues: uncached (no hash) vs cached (has hash).
+        # At init all blocks are uncached.
+        self.free_uncached_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_cached_queue = FreeKVCacheBlockQueue([])
+
+        # Migration shim: external code (e.g. SinkFullAttentionManager)
+        # accesses free_block_queue directly.  Points to uncached queue
+        # which is correct for init-time sink block allocation.
+        # Remove this alias once all external accesses are migrated.
+        self.free_block_queue = self.free_uncached_queue
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -171,7 +177,7 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        self.null_block = self.free_uncached_queue.popleft()
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
@@ -179,78 +185,55 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
-        # Prefix protection: when True, get_new_blocks() only allocates
-        # blocks that have NO cached prefix hash. Set transiently by
-        # kv_cache_manager per allocation attempt, always reset in finally.
-        self._strict_uncached: bool = False
-
     # ------------------------------------------------------------------ #
-    # Prefix protection: strict uncached allocation
+    # Prefix protection: queue-aware helpers
     # ------------------------------------------------------------------ #
-
-    def set_strict_uncached(self, val: bool) -> None:
-        """Set transient strict-uncached mode for prefix protection.
-
-        When True, get_new_blocks() will only allocate blocks without
-        a cached hash, protecting prefix-cached blocks from eviction.
-        """
-        self._strict_uncached = val
 
     def get_num_noncached_free_blocks(self) -> int:
-        """Count free blocks that have NO cached prefix hash.
+        """O(1) count of free blocks with no cached prefix hash."""
+        return self.free_uncached_queue.num_free_blocks
 
-        Walks the free_block_queue linked list. O(N) but called only
-        when prefix protection is active.
-        """
-        count = 0
-        block = self.free_block_queue.fake_free_list_head.next_free_block
-        tail = self.free_block_queue.fake_free_list_tail
-        while block is not tail and block is not None:
-            if block.block_hash is None:
-                count += 1
-            block = block.next_free_block
-        return count
+    def get_num_cached_free_blocks(self) -> int:
+        """O(1) count of free blocks that have a cached prefix hash."""
+        return self.free_cached_queue.num_free_blocks
 
     def _pop_uncached_only(self, num_blocks: int) -> list[KVCacheBlock]:
-        """Pop num_blocks unhashed blocks from free queue.
+        """Pop num_blocks from the uncached queue.
 
-        Cached (hashed) blocks are preserved (put back at tail).
-        This is the core mechanism for prefix protection hard protect:
-        NEVER touch cached blocks.
-
-        Precondition: get_num_noncached_free_blocks() >= num_blocks.
-        Raises AssertionError if insufficient unhashed blocks found.
+        Precondition: free_uncached_queue.num_free_blocks >= num_blocks.
         """
-        ret: list[KVCacheBlock] = []
-        preserved: list[KVCacheBlock] = []
-        queue = self.free_block_queue
-
-        while queue.num_free_blocks > 0 and len(ret) < num_blocks:
-            block = queue.popleft()
-            if block.ref_cnt > 0:
-                # Block claimed by touch() but not yet removed from queue.
-                # Preserve it to avoid permanent loss from the queue.
-                preserved.append(block)
-                continue
-            if block.block_hash is not None:
-                # Cached block — preserve, do not evict
-                preserved.append(block)
-                continue
-            # Unhashed block — allocate it
+        ret = self.free_uncached_queue.popleft_n(num_blocks)
+        for block in ret:
+            assert block.ref_cnt == 0
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_allocated(block)
-            ret.append(block)
+        return ret
 
-        # Put preserved blocks back at tail (maintains LRU order)
-        for b in preserved:
-            queue.append(b)
+    def _pop_uncached_then_cached(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pop from uncached first, then cached for the remainder.
 
-        assert len(ret) == num_blocks, (
-            f"_pop_uncached_only: wanted {num_blocks} uncached blocks "
-            f"but found {len(ret)}. "
-            f"Caller must verify get_num_noncached_free_blocks() >= n first."
-        )
+        Used by UNCACHED_THEN_CACHED alloc mode: exhaust uncached blocks
+        before touching cached blocks.  Cached blocks popped here get
+        evicted from the prefix cache.
+        """
+        uncached_avail = self.free_uncached_queue.num_free_blocks
+        n_from_uncached = min(num_blocks, uncached_avail)
+        n_from_cached = num_blocks - n_from_uncached
+
+        ret: list[KVCacheBlock] = []
+
+        if n_from_uncached > 0:
+            ret.extend(self.free_uncached_queue.popleft_n(n_from_uncached))
+        if n_from_cached > 0:
+            ret.extend(self.free_cached_queue.popleft_n(n_from_cached))
+
+        for block in ret:
+            self._maybe_evict_cached_block(block)
+            assert block.ref_cnt == 0
+            block.ref_cnt += 1
+            if self.metrics_collector:
+                self.metrics_collector.on_block_allocated(block)
         return ret
 
     def get_cached_block(
@@ -371,13 +354,16 @@ class BlockPool:
                 )
             )
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, alloc_mode: str = "any",
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
 
         Args:
             num_blocks: The number of blocks to allocate.
+            alloc_mode: "uncached_only" | "uncached_then_cached" | "any"
 
         Returns:
             A list of new block.
@@ -385,14 +371,29 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        # Prefix protection: strict uncached-only allocation.
-        # Never touches cached (hashed) blocks.
-        if self._strict_uncached and self.enable_caching:
+        # Prefix protection: mode-based allocation
+        if alloc_mode == "uncached_only" and self.enable_caching:
             return self._pop_uncached_only(num_blocks)
+        if alloc_mode == "uncached_then_cached" and self.enable_caching:
+            return self._pop_uncached_then_cached(num_blocks)
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        # alloc_mode == "any": uncached-first, then cached (LRU within each).
+        # NOTE: This differs from the pre-split single-queue global LRU.
+        # Uncached blocks have no reuse value so they are consumed first,
+        # which preserves cached prefix entries longer.  For pp-off
+        # workloads the behavioral difference is negligible because most
+        # free blocks are uncached.  For pp-on workloads this is the
+        # desired behavior (identical to "uncached_then_cached").
+        uncached_avail = self.free_uncached_queue.num_free_blocks
+        n_from_uncached = min(num_blocks, uncached_avail)
+        n_from_cached = num_blocks - n_from_uncached
 
-        # In order to only iterate the list once, we duplicated code a bit
+        ret: list[KVCacheBlock] = []
+        if n_from_uncached > 0:
+            ret.extend(self.free_uncached_queue.popleft_n(n_from_uncached))
+        if n_from_cached > 0:
+            ret.extend(self.free_cached_queue.popleft_n(n_from_cached))
+
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
@@ -412,6 +413,9 @@ class BlockPool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
+
+        If the block is free (ref_cnt==0) and still in the cached queue,
+        it is moved to the uncached queue.
 
         Args:
             block: The block to evict.
@@ -435,11 +439,13 @@ class BlockPool:
 
         block.reset_hash()
 
+        # If this block is free and still linked in cached queue,
+        # move it to uncached queue.
+        if block.ref_cnt == 0 and block.prev_free_block is not None:
+            self.free_cached_queue.remove(block)
+            self.free_uncached_queue.append(block)
+
         if self.enable_kv_cache_events:
-            # FIXME (Chen): Not sure whether we should return `hash_value`
-            # or `(hash_value, group_id)` here. But it's fine now because
-            # we disable hybrid kv cache manager when kv cache event is
-            # enabled, so there is only one group.
             self.kv_event_queue.append(
                 BlockRemoved(
                     block_hashes=[maybe_convert_block_hash(get_block_hash(block_hash))],
@@ -457,10 +463,13 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
-            # ref_cnt=0 means this block is in the free list (i.e. eviction
-            # candidate), so remove it.
+            # ref_cnt=0 means this block is in a free queue (eviction
+            # candidate), so remove it from the correct queue.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                if block.block_hash is not None:
+                    self.free_cached_queue.remove(block)
+                else:
+                    self.free_uncached_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -473,13 +482,20 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
-        # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
+        uncached_to_free: list[KVCacheBlock] = []
+        cached_to_free: list[KVCacheBlock] = []
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+            if block.ref_cnt == 0 and not block.is_null:
+                if block.block_hash is not None:
+                    cached_to_free.append(block)
+                else:
+                    uncached_to_free.append(block)
+        if uncached_to_free:
+            self.free_uncached_queue.append_n(uncached_to_free)
+        if cached_to_free:
+            self.free_cached_queue.append_n(cached_to_free)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -521,7 +537,13 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
 
-        # Remove all hashes from all blocks.
+        # Move all cached free blocks to uncached queue.
+        while self.free_cached_queue.num_free_blocks > 0:
+            block = self.free_cached_queue.popleft()
+            block.reset_hash()
+            self.free_uncached_queue.append(block)
+
+        # Remove all hashes from all blocks (including non-free ones).
         for block in self.blocks:
             block.reset_hash()
 
@@ -536,18 +558,19 @@ class BlockPool:
         return True
 
     def get_num_free_blocks(self) -> int:
-        """Get the number of free blocks in the pool.
+        """Get the number of free blocks in the pool (uncached + cached).
 
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return (self.free_uncached_queue.num_free_blocks
+                + self.free_cached_queue.num_free_blocks)
 
     def expand_blocks(self, n_new_blocks: int) -> None:
         """Expand the block pool at runtime (elastic KV).
 
-        Creates new KVCacheBlock objects and appends them to the free queue.
-        Physical backing is handled by VMM — this only tracks logical blocks.
+        Creates new KVCacheBlock objects and appends them to the uncached
+        free queue.  Physical backing is handled by VMM.
         """
         if n_new_blocks <= 0:
             return
@@ -557,7 +580,7 @@ class BlockPool:
             block_id = old_size + i
             block = KVCacheBlock(block_id=block_id)
             self.blocks.append(block)
-            self.free_block_queue.append(block)
+            self.free_uncached_queue.append(block)
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

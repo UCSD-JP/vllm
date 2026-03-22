@@ -206,7 +206,9 @@ class SingleTypeKVCacheManager(ABC):
             req_blocks.extend(allocated_blocks)
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self, request_id: str, num_tokens: int,
+        num_tokens_main_model: int,
+        alloc_mode: str = "any",
     ) -> list[KVCacheBlock]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -219,6 +221,7 @@ class SingleTypeKVCacheManager(ABC):
             num_tokens_main_model: The number of tokens for the main model (aka target
                 model in spec decode). w/o spec decode, it is num_tokens;
                 with spec decode, it is num_tokens - num_lookahead_tokens.
+            alloc_mode: "uncached_only" | "uncached_then_cached" | "any"
         Returns:
             The new allocated blocks.
         """
@@ -228,7 +231,8 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks, alloc_mode=alloc_mode)
             req_blocks.extend(new_blocks)
             return new_blocks
 
@@ -883,7 +887,9 @@ class MambaManager(SingleTypeKVCacheManager):
             return num_new_blocks + num_evictable_computed_blocks
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        self, request_id: str, num_tokens: int,
+        num_tokens_main_model: int,
+        alloc_mode: str = "any",
     ) -> list[KVCacheBlock]:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if self.mamba_cache_mode != "align":
@@ -892,7 +898,8 @@ class MambaManager(SingleTypeKVCacheManager):
             if self.num_speculative_blocks > 0:
                 num_tokens += self.block_size * self.num_speculative_blocks
             return super().allocate_new_blocks(
-                request_id, num_tokens, num_tokens_main_model
+                request_id, num_tokens, num_tokens_main_model,
+                alloc_mode=alloc_mode,
             )
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if

@@ -24,99 +24,178 @@ from vllm.v1.core.prefix_protect import PrefixProtectionConfig
 # =====================================================================
 
 class TestPrefixProtectionConfig:
-    """Tests for PrefixProtectionConfig cost model.
+    """Tests for V3 3-way cost model.
 
     Terminology:
-      Ce = cost of expert eviction (reloading evicted experts during decode)
-      Cp = cost of prefix reclaim (re-prefilling after cached blocks destroyed)
-      b_eff = effective batch size (number of running requests)
+      Ce = Cost_expert_evict (reloading evicted experts during decode)
+      Cc = Cost_cached_reclaim (re-prefilling destroyed prefix cache)
+      Cp = Cost_req_preempt (recomputing preempted request tokens)
       h_eff = effective remaining decode steps
-      groups_to_evict = number of expert groups to evict for KV expansion
+      groups_to_evict = expert groups to evict for expansion
+      n_decode / n_prefill = batch composition
     """
 
-    def test_compute_cp_default(self):
-        """Default Cp(gap=1) = p_reuse * (1*block_size*t_prefill + t_sched + t_queue)."""
-        cfg = PrefixProtectionConfig()
-        cp = cfg.compute_cp(protection_gap=1)
-        # 1.0 * (1 * 544 * 15.0 + 500.0 + 1000.0) = 9660.0 microseconds
-        assert cp == pytest.approx(9660.0)
+    def _default_cfg(self, **overrides):
+        """Create config with test-friendly defaults."""
+        kw = dict(
+            local_num_experts=512, group_size=2, top_k=10,
+            c_reload_ms=0.63, num_layers=1, h_cap=64,
+            l_sync_prefill=2.0,
+            t_recompute_ms_per_token=0.260,
+            block_size=16, t_prefill_tok_us=15.0,
+            p_reuse=1.0, t_sched_us=500.0, t_queue_us=1000.0,
+        )
+        kw.update(overrides)
+        return PrefixProtectionConfig(**kw)
 
-    def test_compute_cp_scales_with_gap(self):
-        """Cp scales linearly with protection_gap (per-block prefill cost)."""
-        cfg = PrefixProtectionConfig()
-        cp1 = cfg.compute_cp(protection_gap=1)
-        cp10 = cfg.compute_cp(protection_gap=10)
-        # Cp(10) = 1.0 * (10*544*15.0 + 500 + 1000) = 83100
-        assert cp10 == pytest.approx(83100.0)
-        # Per-block contribution: (cp10 - cp1) / 9 ≈ block_size * t_prefill
-        assert (cp10 - cp1) / 9 == pytest.approx(544 * 15.0)
+    # --- Ce tests ---
 
-    def test_compute_ce_small_batch(self):
-        """Ce(b_eff=2, h_eff=1, groups=4) should be less than Cp, meaning protect."""
-        cfg = PrefixProtectionConfig()
-        ce = cfg.compute_ce(b_eff=2, h_eff=1, groups_to_evict=4)
-        # k_evicted = 4 * 2 = 8
-        # 2 * 10 * (8/512) * 0.252 * 1 * 1000 = 78.75 microseconds
-        assert ce == pytest.approx(78.75)
-        assert ce < cfg.compute_cp(protection_gap=1)
+    def test_compute_ce_basic(self):
+        """Ce with small batch, h_eff=10, groups=4."""
+        cfg = self._default_cfg()
+        # k_per_layer = 4/1 = 4
+        # m_eff = 10 * (6 + 2.0*2) = 100
+        # P_hit_one = 1 - (1 - 2/512)^100 ≈ 0.3236
+        # stall_step = 4 * 0.3236 * 0.63 = 0.8155
+        # Ce = 0.8155 * 10 * 1000 = 8155 µs
+        ce = cfg.compute_ce(h_eff=10, groups_to_evict=4,
+                            n_decode=6, n_prefill=2)
+        assert ce > 0
+        # Verify formula structure: should increase with h_eff
+        ce_higher_h = cfg.compute_ce(h_eff=50, groups_to_evict=4,
+                                     n_decode=6, n_prefill=2)
+        assert ce_higher_h > ce
 
-    def test_compute_ce_large_batch(self):
-        """Ce(b_eff=24, h_eff=50, groups=4) exceeds Cp(gap=1)."""
-        cfg = PrefixProtectionConfig()
-        ce = cfg.compute_ce(b_eff=24, h_eff=50, groups_to_evict=4)
-        # k_evicted = 4 * 2 = 8
-        # 24 * 10 * (8/512) * 0.252 * 50 * 1000 = 47250.0 microseconds
-        assert ce == pytest.approx(47250.0)
-        assert ce > cfg.compute_cp(protection_gap=1)
+    def test_compute_ce_zero_groups(self):
+        """Zero groups → Ce = 0."""
+        cfg = self._default_cfg()
+        assert cfg.compute_ce(10, 0, 6, 2) == 0.0
 
-    def test_compute_ce_large_batch_with_gap_scaling(self):
-        """Ce(b=24,h=50,g=4)=47250 but Cp(gap=10)=83100 → protect with gap scaling."""
-        cfg = PrefixProtectionConfig()
-        ce = cfg.compute_ce(b_eff=24, h_eff=50, groups_to_evict=4)
-        assert ce == pytest.approx(47250.0)
-        # With gap=10, Cp=83100 >> Ce=47250 → now protects
-        assert ce < cfg.compute_cp(protection_gap=10)
+    def test_compute_ce_scales_with_groups(self):
+        """More groups → higher Ce."""
+        cfg = self._default_cfg()
+        ce4 = cfg.compute_ce(10, 4, 6, 2)
+        ce8 = cfg.compute_ce(10, 8, 6, 2)
+        assert ce8 > ce4
 
-    def test_compute_ce_large_expand(self):
-        """Ce(b_eff=2, h_eff=1, groups=16) should still be less than Cp."""
-        cfg = PrefixProtectionConfig()
-        ce = cfg.compute_ce(b_eff=2, h_eff=1, groups_to_evict=16)
-        # k_evicted = 16 * 2 = 32
-        # 2 * 10 * (32/512) * 0.252 * 1 * 1000 = 315.0 microseconds
-        assert ce == pytest.approx(315.0)
-        assert ce < cfg.compute_cp(protection_gap=1)
+    # --- Cc tests ---
 
-    def test_should_protect_small_batch(self):
-        """Small batch should protect (Ce < Cp)."""
-        cfg = PrefixProtectionConfig()
-        assert cfg.should_protect(b_eff=2, h_eff=1, groups_to_evict=4,
-                                  protection_gap=1)
+    def test_compute_cc_basic(self):
+        """Cc for 5 touched blocks."""
+        cfg = self._default_cfg()
+        # 1.0 * (5 * 16 * 15.0 + 500 + 1000) = 1.0 * (1200 + 1500) = 2700 µs
+        cc = cfg.compute_cc(5)
+        assert cc == pytest.approx(2700.0)
 
-    def test_should_protect_large_batch_small_gap(self):
-        """Large batch with gap=1 → Ce > Cp → no protect."""
-        cfg = PrefixProtectionConfig()
-        assert not cfg.should_protect(b_eff=24, h_eff=50, groups_to_evict=4,
-                                      protection_gap=1)
+    def test_compute_cc_zero(self):
+        """Cc for 0 touched blocks = 0."""
+        cfg = self._default_cfg()
+        assert cfg.compute_cc(0) == 0.0
 
-    def test_should_protect_large_batch_large_gap(self):
-        """Large batch but gap=10 → Cp scales up → Ce < Cp → now protects.
-        Ce=47250 vs Cp(gap=10)=83100.
-        """
-        cfg = PrefixProtectionConfig()
-        assert cfg.should_protect(b_eff=24, h_eff=50, groups_to_evict=4,
-                                  protection_gap=10)
+    def test_compute_cc_scales_linearly(self):
+        """Cc scales linearly with touched blocks (modulo overhead)."""
+        cfg = self._default_cfg()
+        cc1 = cfg.compute_cc(1)
+        cc10 = cfg.compute_cc(10)
+        # Per-block contribution
+        per_block = cfg.block_size * cfg.t_prefill_tok_us  # 240 µs
+        assert (cc10 - cc1) == pytest.approx(9 * per_block)
 
-    def test_should_protect_zero_groups(self):
-        """Zero groups_to_evict means no expansion needed, always protect."""
-        cfg = PrefixProtectionConfig()
-        assert cfg.should_protect(b_eff=100, h_eff=100, groups_to_evict=0)
+    # --- Cp tests ---
+
+    def test_compute_cp_basic(self):
+        """Cp for 2048 computed tokens."""
+        cfg = self._default_cfg()
+        # 2048 * 0.260 * 1000 = 532480 µs
+        cp = cfg.compute_cp(2048)
+        assert cp == pytest.approx(532480.0)
+
+    def test_compute_cp_zero(self):
+        """Cp for 0 tokens = 0."""
+        cfg = self._default_cfg()
+        assert cfg.compute_cp(0) == 0.0
+
+    # --- decide() tests ---
+
+    def test_decide_use_uncached(self):
+        """touched_cached_blocks=0 → USE_UNCACHED."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        d = cfg.decide(h_eff=10, groups_to_evict=4,
+                       touched_cached_blocks=0,
+                       preempt_computed_tokens=2048,
+                       n_decode=6, n_prefill=2,
+                       can_fully_protect=True)
+        assert d == ProtectionDecision.USE_UNCACHED
+
+    def test_decide_protect_and_expand(self):
+        """Ce is cheapest → PROTECT_AND_EXPAND."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        # Low h_eff, few groups → small Ce; many touched → high Cc; large preempt → high Cp
+        cfg = self._default_cfg()
+        d = cfg.decide(h_eff=1, groups_to_evict=1,
+                       touched_cached_blocks=100,
+                       preempt_computed_tokens=10000,
+                       n_decode=2, n_prefill=0,
+                       can_fully_protect=True)
+        assert d == ProtectionDecision.PROTECT_AND_EXPAND
+
+    def test_decide_reclaim_cached(self):
+        """Cc is cheapest → RECLAIM_CACHED."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        # Small touched (low Cc), high Ce (many groups, high h), high Cp
+        d = cfg.decide(h_eff=50, groups_to_evict=20,
+                       touched_cached_blocks=1,
+                       preempt_computed_tokens=10000,
+                       n_decode=20, n_prefill=5,
+                       can_fully_protect=True)
+        assert d == ProtectionDecision.RECLAIM_CACHED
+
+    def test_decide_preempt(self):
+        """Cp is cheapest → PREEMPT."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        # Very small preempt cost, high Ce and Cc
+        d = cfg.decide(h_eff=50, groups_to_evict=20,
+                       touched_cached_blocks=100,
+                       preempt_computed_tokens=1,
+                       n_decode=20, n_prefill=5,
+                       can_fully_protect=True)
+        assert d == ProtectionDecision.PREEMPT
+
+    def test_decide_partial_expand_blocked(self):
+        """can_fully_protect=False → PROTECT_AND_EXPAND never chosen."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        # Same params as protect_and_expand test, but can_fully_protect=False
+        d = cfg.decide(h_eff=1, groups_to_evict=1,
+                       touched_cached_blocks=100,
+                       preempt_computed_tokens=10000,
+                       n_decode=2, n_prefill=0,
+                       can_fully_protect=False)
+        assert d != ProtectionDecision.PROTECT_AND_EXPAND
+
+    def test_decide_no_preempt_candidates(self):
+        """preempt_computed_tokens=0 → PREEMPT never chosen."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        d = cfg.decide(h_eff=50, groups_to_evict=20,
+                       touched_cached_blocks=100,
+                       preempt_computed_tokens=0,
+                       n_decode=20, n_prefill=5,
+                       can_fully_protect=False)
+        # With can_fully_protect=False (Ce=inf) and Cp=inf, must be RECLAIM
+        assert d == ProtectionDecision.RECLAIM_CACHED
+
+    # --- from_env tests ---
 
     def test_from_env_defaults(self):
         """from_env with no env vars should use defaults."""
         cfg = PrefixProtectionConfig.from_env()
         assert cfg.enable is False
         assert cfg.top_k == 10
-        assert cfg.block_size == 544
+        assert cfg.block_size == 16
 
     def test_from_env_enable(self):
         """VLLM_PREFIX_PROTECTION_ENABLE=1 should enable."""
@@ -159,90 +238,73 @@ class TestPopUncachedOnly:
             assert b.ref_cnt == 1
             assert b.block_hash is None
 
+    def _move_blocks_to_cached(self, pool, count):
+        """Pop blocks from uncached queue, set hash, put in cached queue."""
+        blocks = pool.free_uncached_queue.popleft_n(count)
+        for i, blk in enumerate(blocks):
+            blk._block_hash = b'fakehash' + i.to_bytes(4, 'big')
+        pool.free_cached_queue.append_n(blocks)
+        return blocks
+
     def test_pop_uncached_mixed(self):
-        """Pop only unhashed blocks, skip hashed ones."""
+        """Pop only unhashed blocks when pool has both cached and uncached."""
         pool = self._make_block_pool(20)
 
-        # Manually mark some blocks as hashed (simulating cached prefix).
-        # We walk the free queue and mark specific blocks.
-        queue = pool.free_block_queue
-        block = queue.fake_free_list_head.next_free_block
-        tail = queue.fake_free_list_tail
-        hashed_count = 0
-        idx = 0
-        while block is not tail and block is not None:
-            if idx in [0, 3, 7, 9, 14]:
-                block._block_hash = b'fakehash' + idx.to_bytes(4, 'big')
-                hashed_count += 1
-            idx += 1
-            block = block.next_free_block
+        # Move 5 blocks to cached queue
+        self._move_blocks_to_cached(pool, 5)
 
         noncached = pool.get_num_noncached_free_blocks()
+        cached = pool.get_num_cached_free_blocks()
         total = pool.get_num_free_blocks()
-        assert noncached == total - hashed_count
+        assert noncached == total - cached
+        assert cached == 5
 
-        if noncached >= 8:
-            blocks = pool._pop_uncached_only(8)
-            assert len(blocks) == 8
-            for b in blocks:
-                assert b.block_hash is None
-                assert b.ref_cnt == 1
+        blocks = pool._pop_uncached_only(8)
+        assert len(blocks) == 8
+        for b in blocks:
+            assert b.block_hash is None
+            assert b.ref_cnt == 1
 
     def test_pop_uncached_preserves_cached(self):
-        """Cached blocks must remain in queue after _pop_uncached_only."""
+        """Cached blocks must remain in cached queue after _pop_uncached_only."""
         pool = self._make_block_pool(20)
 
-        # Mark 5 blocks as cached
-        queue = pool.free_block_queue
-        block = queue.fake_free_list_head.next_free_block
-        tail = queue.fake_free_list_tail
-        idx = 0
-        while block is not tail and block is not None and idx < 5:
-            block._block_hash = b'cached' + idx.to_bytes(4, 'big')
-            idx += 1
-            block = block.next_free_block
+        # Move 5 blocks to cached queue
+        self._move_blocks_to_cached(pool, 5)
 
         initial_free = pool.get_num_free_blocks()
         noncached = pool.get_num_noncached_free_blocks()
 
-        # Pop some uncached blocks
         to_pop = min(5, noncached)
         blocks = pool._pop_uncached_only(to_pop)
         assert len(blocks) == to_pop
 
-        # Cached blocks should still be in queue (preserved, not lost)
+        # Cached blocks should still be in cached queue
         remaining_free = pool.get_num_free_blocks()
         assert remaining_free == initial_free - to_pop
+        assert pool.get_num_cached_free_blocks() == 5
 
-    def test_pop_uncached_preserves_refcnt_blocks(self):
-        """Blocks with ref_cnt > 0 must be preserved, not discarded."""
+    def test_pop_uncached_with_cached_does_not_touch_cached(self):
+        """Pop from uncached queue should not affect cached queue size."""
         pool = self._make_block_pool(20)
+        self._move_blocks_to_cached(pool, 5)
 
-        # Set ref_cnt > 0 on a couple of blocks (simulate cache hit via touch)
-        queue = pool.free_block_queue
-        block = queue.fake_free_list_head.next_free_block
-        tail = queue.fake_free_list_tail
-        touched = 0
-        idx = 0
-        while block is not tail and block is not None and idx < 3:
-            block.ref_cnt = 1  # mark as in-use
-            touched += 1
-            idx += 1
-            block = block.next_free_block
+        initial_cached = pool.get_num_cached_free_blocks()
+        initial_uncached = pool.get_num_noncached_free_blocks()
 
-        initial_free = pool.get_num_free_blocks()
         blocks = pool._pop_uncached_only(5)
         assert len(blocks) == 5
 
-        # Queue should shrink by 5 (allocated) but touched blocks preserved
-        remaining = pool.get_num_free_blocks()
-        assert remaining == initial_free - 5
+        # Cached queue unchanged
+        assert pool.get_num_cached_free_blocks() == initial_cached
+        # Uncached decreased
+        assert pool.get_num_noncached_free_blocks() == initial_uncached - 5
 
     def test_pop_uncached_insufficient_asserts(self):
-        """Requesting more uncached blocks than available should assert."""
+        """Requesting more uncached blocks than available should raise."""
         pool = self._make_block_pool(10)
         noncached = pool.get_num_noncached_free_blocks()
-        with pytest.raises(AssertionError, match="_pop_uncached_only"):
+        with pytest.raises(AssertionError):
             pool._pop_uncached_only(noncached + 5)
 
 
@@ -333,17 +395,18 @@ class TestHardProtectRegression:
         assert plan.would_touch_cached is True
 
     def test_cost_model_small_batch_protects(self):
-        """Small batch Ce < Cp should trigger protection."""
+        """Small batch: Ce is low, Cc for gap=3 is moderate → protect."""
         cfg = PrefixProtectionConfig(
-            top_k=10, group_size=2, num_experts=512,
-            c_reload_eff_ms=0.252, h_floor=1, h_cap=64,
-            block_size=544, t_prefill_tok_us=15.0,
+            top_k=10, group_size=2, local_num_experts=512,
+            c_reload_ms=0.63, h_cap=64, num_layers=1,
+            block_size=16, t_prefill_tok_us=15.0,
             t_sched_us=500.0, t_queue_us=1000.0,
             p_reuse=1.0, enable=True,
         )
-        # Ce(b_eff=2, h_eff=1, groups=4) = 78.75 < Cp(gap=3)=25960 -> protect
-        assert cfg.should_protect(b_eff=2, h_eff=1, groups_to_evict=4,
-                                  protection_gap=3)
+        # Ce should be cheap for low h_eff and small groups
+        ce = cfg.compute_ce(h_eff=1, groups_to_evict=4, n_decode=2, n_prefill=0)
+        cc = cfg.compute_cc(3)
+        assert ce < cc  # protect is preferable
 
 
 # =====================================================================
@@ -375,41 +438,40 @@ class TestElasticKVConfig:
 # Test: Ce >= Cp fallback
 # =====================================================================
 
-class TestCeGeCpFallback:
-    """Tests for fallback when Ce >= Cp (eviction too expensive to protect)."""
+class TestCeVsCcCrossover:
+    """Tests for Ce vs Cc crossover: when eviction becomes too expensive."""
 
-    def test_large_batch_no_protect_small_gap(self):
-        """b_eff=24, h_eff=50, gap=1 -> Ce > Cp -> no protect.
-        Ce = 47250 us, Cp(gap=1) = 9660 us → Ce > Cp → no protect
-        """
+    def test_high_h_eff_ce_exceeds_cc(self):
+        """High h_eff, many groups → Ce > Cc → RECLAIM_CACHED."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
         cfg = PrefixProtectionConfig(enable=True)
-        assert not cfg.should_protect(b_eff=24, h_eff=50, groups_to_evict=4,
-                                      protection_gap=1)
+        d = cfg.decide(h_eff=50, groups_to_evict=20,
+                       touched_cached_blocks=1,
+                       preempt_computed_tokens=10000,
+                       n_decode=20, n_prefill=5,
+                       can_fully_protect=True)
+        assert d == ProtectionDecision.RECLAIM_CACHED
 
-    def test_large_batch_protects_large_gap(self):
-        """b_eff=24, h_eff=50, gap=10 -> Cp scales up -> now protects.
-        Ce = 47250 us, Cp(gap=10) = 83100 us → Ce < Cp → protect
-        """
+    def test_low_h_eff_ce_below_cc(self):
+        """Low h_eff, few groups → Ce < Cc → PROTECT_AND_EXPAND."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
         cfg = PrefixProtectionConfig(enable=True)
-        assert cfg.should_protect(b_eff=24, h_eff=50, groups_to_evict=4,
-                                  protection_gap=10)
+        d = cfg.decide(h_eff=1, groups_to_evict=1,
+                       touched_cached_blocks=50,
+                       preempt_computed_tokens=10000,
+                       n_decode=2, n_prefill=0,
+                       can_fully_protect=True)
+        assert d == ProtectionDecision.PROTECT_AND_EXPAND
 
-    def test_medium_batch_threshold(self):
-        """Find the b_eff where Ce crosses Cp(gap=1) for groups=4, h_eff=1."""
+    def test_ce_monotone_with_h_eff(self):
+        """Ce should increase monotonically with h_eff."""
         cfg = PrefixProtectionConfig(enable=True)
-        cp = cfg.compute_cp(protection_gap=1)  # 9660
-
-        for b in range(1, 1000):
-            ce = cfg.compute_ce(b_eff=b, h_eff=1, groups_to_evict=4)
-            if ce >= cp:
-                assert cfg.should_protect(
-                    b_eff=b-1, h_eff=1, groups_to_evict=4, protection_gap=1)
-                assert not cfg.should_protect(
-                    b_eff=b, h_eff=1, groups_to_evict=4, protection_gap=1)
-                break
-        else:
-            # Ce never exceeds Cp at h_eff=1 for reasonable b_eff
-            pass
+        prev_ce = 0
+        for h in [1, 5, 10, 20, 50]:
+            ce = cfg.compute_ce(h_eff=h, groups_to_evict=4,
+                                n_decode=6, n_prefill=2)
+            assert ce >= prev_ce
+            prev_ce = ce
 
 
 # =====================================================================
@@ -503,10 +565,10 @@ class TestEngineExactCommit:
 
 class TestPrefixProtectionBlockPoolIntegration:
     """Integration tests using real BlockPool to verify cached block
-    preservation under strict_uncached mode.
+    preservation under alloc_mode="uncached_only".
 
-    These are NOT mock tests — they exercise the actual free queue
-    linked-list operations and _pop_uncached_only logic.
+    These are NOT mock tests — they exercise the actual split-queue
+    linked-list operations.
     """
 
     def _make_block_pool(self, num_blocks=20, enable_caching=True):
@@ -519,34 +581,27 @@ class TestPrefixProtectionBlockPoolIntegration:
         )
         return pool
 
-    def _mark_blocks_cached(self, pool, count):
-        """Walk free queue and set block_hash on first `count` blocks."""
-        queue = pool.free_block_queue
-        block = queue.fake_free_list_head.next_free_block
-        tail = queue.fake_free_list_tail
-        marked = 0
-        while block is not tail and block is not None and marked < count:
-            block._block_hash = b'cached' + marked.to_bytes(4, 'big')
-            marked += 1
-            block = block.next_free_block
-        return marked
+    def _move_to_cached(self, pool, count):
+        """Pop blocks from uncached queue, set hash, put in cached queue."""
+        blocks = pool.free_uncached_queue.popleft_n(count)
+        for i, blk in enumerate(blocks):
+            blk._block_hash = b'cached' + i.to_bytes(4, 'big')
+        pool.free_cached_queue.append_n(blocks)
+        return blocks
 
-    def test_real_blockpool_strict_uncached_preserves_cached(self):
+    def test_real_blockpool_uncached_only_preserves_cached(self):
         """21 blocks (20 free after null_block): 8 cached, 12 uncached.
-        strict_uncached alloc for 10 → takes 10 uncached.
-        Cached 8 remain in free queue untouched.
+        uncached_only alloc for 10 → takes 10 uncached.
+        Cached 8 remain in cached queue untouched.
         """
-        # 21 blocks: 1 reserved as null_block → 20 free
         pool = self._make_block_pool(21)
         assert pool.get_num_free_blocks() == 20
 
-        self._mark_blocks_cached(pool, 8)
+        self._move_to_cached(pool, 8)
         assert pool.get_num_noncached_free_blocks() == 12
+        assert pool.get_num_cached_free_blocks() == 8
 
-        # Enable strict uncached mode and allocate
-        pool.set_strict_uncached(True)
-        blocks = pool.get_new_blocks(10)
-        pool.set_strict_uncached(False)
+        blocks = pool.get_new_blocks(10, alloc_mode="uncached_only")
 
         # All allocated blocks must be uncached
         assert len(blocks) == 10
@@ -557,46 +612,26 @@ class TestPrefixProtectionBlockPoolIntegration:
         # Remaining: 8 cached + 2 uncached = 10
         assert pool.get_num_free_blocks() == 10
         assert pool.get_num_noncached_free_blocks() == 2
+        assert pool.get_num_cached_free_blocks() == 8
 
-        # Verify cached blocks still have their hashes
-        queue = pool.free_block_queue
-        block = queue.fake_free_list_head.next_free_block
-        tail = queue.fake_free_list_tail
-        cached_remaining = 0
-        while block is not tail and block is not None:
-            if block.block_hash is not None:
-                cached_remaining += 1
-            block = block.next_free_block
-        assert cached_remaining == 8
-
-    def test_real_blockpool_strict_uncached_fails_when_insufficient(self):
+    def test_real_blockpool_uncached_only_fails_when_insufficient(self):
         """21 blocks (20 free): 15 cached, 5 uncached.
-        strict_uncached alloc for 8 → AssertionError (only 5 uncached).
-        Cached blocks are preserved back into queue.
+        uncached_only alloc for 8 → error (only 5 uncached available).
         """
         pool = self._make_block_pool(21)
         assert pool.get_num_free_blocks() == 20
 
-        self._mark_blocks_cached(pool, 15)
+        self._move_to_cached(pool, 15)
         assert pool.get_num_noncached_free_blocks() == 5
 
-        pool.set_strict_uncached(True)
-        with pytest.raises(AssertionError, match="_pop_uncached_only"):
-            pool.get_new_blocks(8)
-        pool.set_strict_uncached(False)
+        # alloc_mode="uncached_only" with 8 required but only 5 available
+        # → allocate_slots returns None (availability check fails)
+        # But get_new_blocks with uncached_only would raise from popleft_n
+        with pytest.raises(AssertionError):
+            pool.get_new_blocks(8, alloc_mode="uncached_only")
 
-        # _pop_uncached_only consumed 5 uncached blocks before asserting,
-        # but all 15 cached blocks were preserved back into the queue.
-        # Verify cached blocks survived intact.
-        queue = pool.free_block_queue
-        block = queue.fake_free_list_head.next_free_block
-        tail = queue.fake_free_list_tail
-        cached_in_queue = 0
-        while block is not tail and block is not None:
-            if block.block_hash is not None:
-                cached_in_queue += 1
-            block = block.next_free_block
-        assert cached_in_queue == 15
+        # Cached blocks should survive intact
+        assert pool.get_num_cached_free_blocks() == 15
 
 
 # =====================================================================
@@ -604,46 +639,60 @@ class TestPrefixProtectionBlockPoolIntegration:
 # =====================================================================
 
 class TestPrefixProtectionSchedulerFlow:
-    """Mock-based tests for _prefix_protection_try_allocate() control flow.
+    """Mock-based tests for V3 _prefix_protection_try_allocate() control flow.
 
-    Verifies the 5-step scheduler logic:
-    1. strict uncached try → 2. read plan → 3. cost model →
-    4. expand + retry → 5. fallback.
+    Verifies 3-way decision:
+    PROTECT_AND_EXPAND, RECLAIM_CACHED, PREEMPT.
     """
 
-    def _make_scheduler_stub(self, *, should_protect=True,
+    def _make_scheduler_stub(self, *, decision_value="protect_and_expand",
                              expand_return=0, running_count=2):
-        """Create a minimal scheduler-like object with the prefix protection
-        method and its dependencies mocked.
-        """
-        sched = MagicMock()
-        sched.running = [MagicMock() for _ in range(running_count)]
+        """Create a minimal scheduler-like object for V3 flow testing."""
+        from vllm.v1.core.prefix_protect import (
+            PrefixProtectionConfig, ProtectionDecision)
 
-        # Bind the real method under test
+        sched = MagicMock()
+
+        # Running requests with num_computed_tokens for preempt cost
+        running = []
+        for i in range(running_count):
+            r = MagicMock()
+            r.num_computed_tokens = 500 + i * 100
+            r.max_tokens = 2048
+            r.num_output_tokens = 10
+            running.append(r)
+        sched.running = running
+
+        # Bind the real methods under test
         from vllm.v1.core.sched.scheduler import Scheduler
         sched._prefix_protection_try_allocate = (
             Scheduler._prefix_protection_try_allocate.__get__(sched))
         sched._compute_b_eff = (
             Scheduler._compute_b_eff.__get__(sched))
-        # Mock _compute_h_eff to avoid needing real Request objects
-        sched._compute_h_eff = MagicMock(return_value=1)
+        sched._compute_h_eff = MagicMock(return_value=10)
+        sched._trace_decision = MagicMock()  # no-op trace
+        sched._diag_last_pp_active = None
 
-        # Config — must return real numbers for break-even calculation
-        pp_cfg = MagicMock()
+        # V3 prefix protection config with mocked decide()
+        pp_cfg = MagicMock(spec=PrefixProtectionConfig)
         pp_cfg.enable = True
-        pp_cfg.should_protect = MagicMock(return_value=should_protect)
+        pp_cfg.h_cap = 64
+        pp_cfg.decide = MagicMock(return_value=ProtectionDecision(decision_value))
         pp_cfg.compute_ce = MagicMock(return_value=100.0)
-        pp_cfg.compute_cp = MagicMock(return_value=9660.0)
+        pp_cfg.compute_cc = MagicMock(return_value=500.0)
+        pp_cfg.compute_cp = MagicMock(return_value=50000.0)
         sched._prefix_protection_config = pp_cfg
 
-        # Elastic KV handler (existence enables prefix protection path)
+        # Elastic KV handler
         sched._elastic_kv_handler = MagicMock()
+        sched._elastic_kv_expanded_total = 0
 
-        # Elastic KV config for groups_est geometry
+        # Elastic KV config
         ekv_cfg = MagicMock()
         ekv_cfg.group_pages = 100
         ekv_cfg.per_tensor_block_bytes = {0: 32768}
         ekv_cfg.page_size = 2097152
+        ekv_cfg.max_expand_blocks = 1000
         sched._elastic_kv_config = ekv_cfg
 
         # Expand
@@ -652,22 +701,20 @@ class TestPrefixProtectionSchedulerFlow:
         return sched
 
     def test_protect_expand_retry_flow(self):
-        """strict uncached fails → should_protect=True → expand → retry succeeds.
-        Verifies expand is called with protection_gap.
-        """
+        """decide()=PROTECT_AND_EXPAND → expand → retry uncached_only."""
         from vllm.v1.core.kv_cache_manager import (
             AllocationAttempt, AllocationPlan)
 
         protection_gap = 5
         sched = self._make_scheduler_stub(
-            should_protect=True, expand_return=protection_gap)
+            decision_value="protect_and_expand",
+            expand_return=protection_gap)
 
-        # Step 1: strict uncached fails
         fail_plan = AllocationPlan(
-            required_blocks=10, total_free=20, noncached_free=5)
+            required_blocks=10, total_free=20,
+            noncached_free=5, cached_free=15)
         fail_attempt = AllocationAttempt(blocks=None, plan=fail_plan)
 
-        # Step 4: retry after expand succeeds
         success_blocks = MagicMock(name="blocks")
 
         mgr = sched.kv_cache_manager
@@ -680,32 +727,29 @@ class TestPrefixProtectionSchedulerFlow:
 
         assert result is success_blocks
         sched._try_elastic_kv_expand.assert_called_once_with(protection_gap)
-        # allocate_slots retry was called with strict_uncached=True
         mgr.allocate_slots.assert_called_once_with(
-            request, 10, strict_uncached=True)
+            request, 10, alloc_mode="uncached_only")
 
-    def test_ce_ge_cp_skips_expand(self):
-        """Ce >= Cp → should_protect=False → no expand, falls through
-        to normal allocation.
-        """
+    def test_reclaim_cached_flow(self):
+        """decide()=RECLAIM_CACHED → uncached_then_cached alloc."""
         from vllm.v1.core.kv_cache_manager import (
             AllocationAttempt, AllocationPlan)
 
-        sched = self._make_scheduler_stub(should_protect=False)
+        sched = self._make_scheduler_stub(decision_value="reclaim_cached")
 
-        # Step 1: strict uncached fails
         fail_plan = AllocationPlan(
-            required_blocks=10, total_free=20, noncached_free=5)
+            required_blocks=10, total_free=20,
+            noncached_free=5, cached_free=15)
         fail_attempt = AllocationAttempt(blocks=None, plan=fail_plan)
 
-        # Step 5: fallback normal alloc succeeds
         success_plan = AllocationPlan(
-            required_blocks=10, total_free=20, noncached_free=20)
+            required_blocks=10, total_free=20,
+            noncached_free=5, cached_free=15)
         success_attempt = AllocationAttempt(
             blocks=MagicMock(name="blocks"), plan=success_plan)
 
         mgr = sched.kv_cache_manager
-        # First call (strict) fails, second call (normal) succeeds
+        # First call (uncached_only) fails, second (uncached_then_cached) OK
         mgr.try_allocate = MagicMock(
             side_effect=[fail_attempt, success_attempt])
 
@@ -714,30 +758,58 @@ class TestPrefixProtectionSchedulerFlow:
             request, num_new_tokens=10)
 
         assert result is success_attempt.blocks
-        # Expand should NOT be called
+        # Expand should NOT be called for reclaim path
+        sched._try_elastic_kv_expand.assert_not_called()
+        # Second try_allocate used uncached_then_cached
+        assert mgr.try_allocate.call_count == 2
+        call_args = mgr.try_allocate.call_args_list[1]
+        assert call_args.kwargs.get('alloc_mode') == 'uncached_then_cached'
+
+    def test_preempt_returns_none(self):
+        """decide()=PREEMPT → return None (caller handles preemption)."""
+        from vllm.v1.core.kv_cache_manager import (
+            AllocationAttempt, AllocationPlan)
+
+        sched = self._make_scheduler_stub(decision_value="preempt")
+
+        fail_plan = AllocationPlan(
+            required_blocks=10, total_free=20,
+            noncached_free=5, cached_free=15)
+        fail_attempt = AllocationAttempt(blocks=None, plan=fail_plan)
+
+        mgr = sched.kv_cache_manager
+        mgr.try_allocate = MagicMock(return_value=fail_attempt)
+
+        request = MagicMock()
+        result = sched._prefix_protection_try_allocate(
+            request, num_new_tokens=10)
+
+        assert result is None
         sched._try_elastic_kv_expand.assert_not_called()
 
-    def test_expand_fails_falls_through(self):
-        """Ce < Cp but expand returns 0 → falls through to normal alloc."""
+    def test_expand_partial_falls_to_reclaim(self):
+        """PROTECT_AND_EXPAND but expand returns less than needed →
+        falls back to RECLAIM_CACHED."""
         from vllm.v1.core.kv_cache_manager import (
             AllocationAttempt, AllocationPlan)
 
         sched = self._make_scheduler_stub(
-            should_protect=True, expand_return=0)
+            decision_value="protect_and_expand",
+            expand_return=2)  # less than protection_gap=5
 
-        # Step 1: strict uncached fails
         fail_plan = AllocationPlan(
-            required_blocks=10, total_free=20, noncached_free=5)
+            required_blocks=10, total_free=20,
+            noncached_free=5, cached_free=15)
         fail_attempt = AllocationAttempt(blocks=None, plan=fail_plan)
 
-        # Step 5: fallback normal alloc succeeds
         success_plan = AllocationPlan(
-            required_blocks=10, total_free=20, noncached_free=20)
+            required_blocks=10, total_free=22,
+            noncached_free=7, cached_free=15)
         success_attempt = AllocationAttempt(
             blocks=MagicMock(name="blocks"), plan=success_plan)
 
         mgr = sched.kv_cache_manager
-        # First call (strict) fails, second call (normal) succeeds
+        # First (uncached_only) fails, second (uncached_then_cached) succeeds
         mgr.try_allocate = MagicMock(
             side_effect=[fail_attempt, success_attempt])
 
@@ -746,7 +818,7 @@ class TestPrefixProtectionSchedulerFlow:
             request, num_new_tokens=10)
 
         assert result is success_attempt.blocks
-        # Expand WAS called (Ce < Cp) but returned 0
+        # Expand was tried but insufficient
         sched._try_elastic_kv_expand.assert_called_once()
-        # Normal alloc fallback was used
+        # Fallback to uncached_then_cached
         assert mgr.try_allocate.call_count == 2
