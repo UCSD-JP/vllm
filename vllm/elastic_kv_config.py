@@ -24,12 +24,14 @@ class ElasticKVConfig:
     per_tensor_block_bytes: dict[int, int] | None = None
     page_size: int = 0
 
-    # Runtime Ce params (set by worker, not from env)
+    # Runtime Ce params (set by worker, not from env).
+    # Default 0 means "not yet set by worker" — scheduler propagation
+    # only overwrites PrefixProtectionConfig when value > 0.
     local_num_experts: int = 0
     expert_group_size: int = 0
     expert_top_k: int = 0
     num_layers: int = 0
-    c_reload_ms: float = 0.63  # default PCIe
+    c_reload_ms: float = 0.0  # 0 = use PP env; worker sets actual value
 
     @classmethod
     def from_env(cls) -> "ElasticKVConfig":

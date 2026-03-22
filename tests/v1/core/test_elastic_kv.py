@@ -654,7 +654,7 @@ class TestElasticKVConfigCeParams:
         assert cfg.expert_group_size == 0
         assert cfg.expert_top_k == 0
         assert cfg.num_layers == 0
-        assert cfg.c_reload_ms == 0.63
+        assert cfg.c_reload_ms == 0.0  # 0 = not set by worker
 
     def test_ce_params_from_env_not_set(self):
         """from_env() should not read Ce params from env."""
