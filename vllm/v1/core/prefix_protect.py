@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefix Protection V3 cost model — 3-way decision (Ce / Cc / Cp).
+"""Prefix Protection V3 cost model — work-conserving decision (Ce / Cc / Cp).
 
 Ce = Cost_expert_evict  — reloading evicted experts during decode
 Cc = Cost_cached_reclaim — re-prefilling destroyed prefix cache blocks
-Cp = Cost_req_preempt   — recomputing preempted request tokens
+Cp = Cost_req_preempt   — recomputing preempted request tokens (RUNNING only)
 
 Decision:
   USE_UNCACHED         — uncached free blocks suffice, no cost
   PROTECT_AND_EXPAND   — Ce is cheapest: expand KV via expert eviction
   RECLAIM_CACHED       — Cc is cheapest: reclaim cached blocks
-  PREEMPT              — Cp is cheapest: preempt a running request
+  PREEMPT              — Cp is cheapest: preempt a running request (RUNNING only)
+
+WAITING path is strictly work-conserving: Ce vs Cc comparison only.
+Fallback is RECLAIM_CACHED (always progress or allocation failure).
+DEFER was removed — it caused non-work-conserving stagnation.
 
 V3 formulas (VAMP_V3_TWO_LAYER_DESIGN.md):
   Ce = stall_step × H_eff
@@ -27,11 +31,16 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+class CallerKind(Enum):
+    RUNNING = "running"
+    WAITING = "waiting"
+
+
 class ProtectionDecision(Enum):
     USE_UNCACHED = "use_uncached"
     PROTECT_AND_EXPAND = "protect_and_expand"
     RECLAIM_CACHED = "reclaim_cached"
-    PREEMPT = "preempt"
+    PREEMPT = "preempt"         # running only: preempt another victim
 
 
 @dataclass
@@ -53,7 +62,9 @@ class PrefixProtectionConfig:
     # --- Cc parameters ---
     block_size: int = 16           # tokens per block
     t_prefill_tok_us: float = 15.0 # per-token prefill cost for cache rebuild
-    p_reuse: float = 1.0           # probability of prefix reuse
+    p_reuse: float = 1.0           # probability of prefix reuse (static fallback)
+    p_reuse_alpha: float = 0.5     # dynamic p_reuse = alpha * hit_rate
+    cc_age_scale: float = 2000.0   # recency age decay half-scale for Cc
     t_sched_us: float = 500.0      # scheduler overhead (µs)
     t_queue_us: float = 1000.0     # queue overhead (µs)
 
@@ -83,6 +94,10 @@ class PrefixProtectionConfig:
             t_sched_us=float(os.environ.get("VLLM_PP_T_SCHED", "500.0")),
             t_queue_us=float(os.environ.get("VLLM_PP_T_QUEUE", "1000.0")),
             p_reuse=float(os.environ.get("VLLM_PP_P_REUSE", "1.0")),
+            p_reuse_alpha=float(
+                os.environ.get("VLLM_PP_P_REUSE_ALPHA", "0.5")),
+            cc_age_scale=float(
+                os.environ.get("VLLM_PP_CC_AGE_SCALE", "2000.0")),
         )
 
     # ------------------------------------------------------------------ #
@@ -109,27 +124,63 @@ class PrefixProtectionConfig:
         stall_step = k_per_layer * p_hit_one * self.c_reload_ms
         return stall_step * h_eff * 1000  # → µs
 
-    def compute_cc(self, touched_cached_blocks: int) -> float:
+    def compute_cc(self, touched_cached_blocks: int,
+                   hit_rate: float | None = None,
+                   recency_age: float = 0.0) -> float:
         """Cc: cached free block reclaim cost (microseconds).
 
         Prefix re-prefill cost. Linear in touched_cached_blocks.
+        When hit_rate is provided and p_reuse_alpha > 0, uses dynamic
+        p_reuse = alpha * hit_rate instead of static p_reuse.
+
+        Recency age decay: reclaim candidates (front of LRU cached queue)
+        have high age and low reuse probability. Cost is discounted:
+            p_effective = p_base / (1 + recency_age / cc_age_scale)
+
+        With cc_age_scale=2000 and front_step_age as input:
+            age=0     → p_eff = p (fresh, full cost)
+            age=2000  → p_eff = p × 0.50 (half-life)
+            age=14000 → p_eff = p × 0.125 (Ce-competitive)
+            age=18k   → p_eff = p × 0.10 (cold tail, Cc ≈ Ce)
         """
         if touched_cached_blocks <= 0:
             return 0.0
-        return self.p_reuse * (
+        if hit_rate is not None and self.p_reuse_alpha > 0:
+            p = self.p_reuse_alpha * hit_rate
+        else:
+            p = self.p_reuse  # static fallback
+        # Recency age decay: cold blocks are cheaper to reclaim
+        if recency_age > 0 and self.cc_age_scale > 0:
+            p = p / (1.0 + recency_age / self.cc_age_scale)
+        return p * (
             touched_cached_blocks * self.block_size * self.t_prefill_tok_us
             + self.t_sched_us + self.t_queue_us)
 
-    def compute_cp(self, preempt_computed_tokens: int) -> float:
-        """V3 Cost_req_preempt (microseconds).
+    def compute_cp_running(self, victim_computed_tokens: int) -> float:
+        """Running victim preemption cost (microseconds).
 
-        NOTE: single-candidate heuristic.
-        The scheduler may preempt multiple requests, so this value is
-        a lower bound on actual total preempt cost.
+        Model: preempting frees full blocks (-> cached queue, handled by Cc)
+        + at most 1 partial tail block (-> uncached queue).
+        Cost = scheduler overhead + partial_tail_tokens * t_prefill_tok_us.
+        If no partial tail (computed % block_size == 0), uncached_yield=0
+        -> Cp=inf (useless preemption for uncached deficit).
+
+        NOTE (POC): Cp is estimated from the best-yield victim across running,
+        but actual preemption follows scheduler policy (FIFO/Priority) — the
+        two victims may differ.  Accepted mismatch for POC scope.
         """
-        if preempt_computed_tokens <= 0:
+        if victim_computed_tokens <= 0:
             return 0.0
-        return preempt_computed_tokens * self.t_recompute_ms_per_token * 1000
+        partial_tail_tokens = victim_computed_tokens % self.block_size
+        if partial_tail_tokens == 0:
+            return float('inf')  # no uncached yield -> useless preemption
+        # Cost = scheduling overhead + partial tail token replay
+        return (self.t_sched_us + self.t_queue_us
+                + partial_tail_tokens * self.t_prefill_tok_us)
+
+    def compute_cp(self, preempt_computed_tokens: int) -> float:
+        """Backward-compat wrapper -> compute_cp_running."""
+        return self.compute_cp_running(preempt_computed_tokens)
 
     # ------------------------------------------------------------------ #
     # V3 3-way decision
@@ -139,20 +190,35 @@ class PrefixProtectionConfig:
                touched_cached_blocks: int,
                preempt_computed_tokens: int,
                n_decode: int, n_prefill: int,
-               can_fully_protect: bool) -> ProtectionDecision:
-        """3-way minimum cost selection.
+               can_fully_protect: bool,
+               caller: CallerKind = CallerKind.RUNNING,
+               hit_rate: float | None = None,
+               recency_age: float = 0.0,
+               ) -> ProtectionDecision:
+        """Work-conserving cost selection with caller-aware semantics.
+
+        Both callers use 3-way Ce/Cc/Cp comparison.
+        RUNNING fallback: PREEMPT.
+        WAITING fallback: RECLAIM_CACHED (progress guaranteed, no DEFER).
+          WAITING can still choose PREEMPT when Cp is cheapest and
+          running > 0 (preempt_computed_tokens > 0).
 
         Args:
             h_eff: Effective remaining decode steps (V3 H_eff).
             groups_to_evict: Expert groups to evict for protection.
             touched_cached_blocks: Cached blocks that would be reclaimed.
-            preempt_computed_tokens: Computed tokens of worst preempt
-                candidate (single-candidate heuristic, lower bound).
+            preempt_computed_tokens: Computed tokens of best preempt
+                victim (yield-aware, partial-tail model).  0 when
+                running is empty.
             n_decode: Number of decode requests in batch.
             n_prefill: Number of prefill requests in batch.
             can_fully_protect: True if remaining expand capacity >=
                 protection_gap.  When False, PROTECT_AND_EXPAND is
                 structurally blocked (partial expand prevention).
+            caller: RUNNING or WAITING — determines fallback when Cp wins.
+            hit_rate: Sliding-window prefix cache hit rate for dynamic Cc.
+            recency_age: Step-based recency age of LRU front cached block.
+                Higher age → lower p_reuse → cheaper Cc (cold blocks).
 
         Returns:
             ProtectionDecision enum.
@@ -162,10 +228,9 @@ class PrefixProtectionConfig:
 
         Ce = (self.compute_ce(h_eff, groups_to_evict, n_decode, n_prefill)
               if can_fully_protect else float('inf'))
-        Cc = self.compute_cc(touched_cached_blocks)
-        Cp = self.compute_cp(preempt_computed_tokens)
-
-        # When Cp==0 (no preempt candidates), PREEMPT is not an option.
+        Cc = self.compute_cc(touched_cached_blocks, hit_rate=hit_rate,
+                            recency_age=recency_age)
+        Cp = self.compute_cp_running(preempt_computed_tokens)
         if Cp <= 0:
             Cp = float('inf')
 
@@ -173,7 +238,16 @@ class PrefixProtectionConfig:
             return ProtectionDecision.PROTECT_AND_EXPAND
         if Cc <= Ce and Cc <= Cp:
             return ProtectionDecision.RECLAIM_CACHED
-        return ProtectionDecision.PREEMPT
+        # Cp is cheapest → PREEMPT
+        if caller == CallerKind.RUNNING:
+            return ProtectionDecision.PREEMPT
+        else:
+            # WAITING: Cp won but fallback is RECLAIM_CACHED
+            # (work-conserving — no idle deferral).
+            # If running > 0, preemption is viable.
+            if preempt_computed_tokens > 0:
+                return ProtectionDecision.PREEMPT
+            return ProtectionDecision.RECLAIM_CACHED
 
     # ------------------------------------------------------------------ #
     # Legacy compatibility: should_protect() for existing callers

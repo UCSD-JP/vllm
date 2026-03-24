@@ -124,6 +124,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Step-based age: scheduler step when this block entered free_cached_queue.
+    # Used to compute step-age on touch/evict: age = current_step - this.
+    _cached_free_step: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash

@@ -1295,8 +1295,8 @@ class Worker(WorkerBase):
         # Calculate expert groups to evict
         group_pages = pool.group_pages
         groups_needed = math.ceil(pages_needed / group_pages)
-        # Round up to quantum (expand_group_quantum) for efficiency
-        quantum = cfg.expand_group_quantum
+        # Round up to quantum (min_expand_unit) for efficiency
+        quantum = cfg.min_expand_unit
         groups_planned = ((groups_needed + quantum - 1) // quantum) * quantum
 
         evictable_groups = cache.count_evictable_groups()

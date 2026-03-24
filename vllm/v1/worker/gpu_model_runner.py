@@ -3319,6 +3319,11 @@ class GPUModelRunner(
             self._expert_cache.pre_step(moe_layers)
             if self._vmm_pool is not None:
                 self._vmm_pool.mark_step_start()
+            # Set routing snapshot state: only capture when experts
+            # are actually evicted (dormant → no snapshot overhead).
+            snap = self._expert_cache.has_evicted_experts()
+            for layer in moe_layers:
+                layer._snapshot_active = snap
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -4609,6 +4614,14 @@ class GPUModelRunner(
                 f"forced_batch_desc num_tokens mismatch: "
                 f"{batch_desc.num_tokens} vs {forced_batch_desc.num_tokens}")
             batch_desc = forced_batch_desc
+            # Set snapshot state on MoE layers for this graph variant:
+            # offload_active=True → capture with snapshot ops
+            # offload_active=False → capture without (dormant-clean graph)
+            moe_layers = getattr(self, '_expert_cache_layers', None)
+            if moe_layers:
+                snap = forced_batch_desc.offload_active
+                for layer in moe_layers:
+                    layer._snapshot_active = snap
 
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = (

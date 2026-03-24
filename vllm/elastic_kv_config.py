@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class ElasticKVConfig:
     enable: bool = False
     min_resident_ratio: float = 0.5
-    expand_group_quantum: int = 4
+    min_expand_unit: int = 4
     expert_eviction_policy: str = "lru"
 
     # Computed at runtime (not from env)
@@ -39,7 +39,7 @@ class ElasticKVConfig:
             enable=os.environ.get("VLLM_ELASTIC_KV_ENABLE", "0") == "1",
             min_resident_ratio=float(
                 os.environ.get("VLLM_ELASTIC_KV_MIN_RESIDENT", "0.5")),
-            expand_group_quantum=int(
+            min_expand_unit=int(
                 os.environ.get("VLLM_ELASTIC_KV_GROUPS_PER_EXPAND", "4")),
             expert_eviction_policy=os.environ.get(
                 "VLLM_ELASTIC_KV_EVICT_POLICY", "lru"),
@@ -69,16 +69,16 @@ class ElasticKVConfig:
         self.per_tensor_block_bytes = dict(per_tensor_block_bytes)
         self.page_size = pool.page_size
 
-        natural_pages = self.expand_group_quantum * pool.group_pages
-        natural_blocks = max_blocks_for_pages(
+        natural_pages = self.min_expand_unit * pool.group_pages
+        kv_blocks_per_expand = max_blocks_for_pages(
             natural_pages, per_tensor_block_bytes, pool.page_size)
 
         logger.info(
-            "ElasticKV: expand_group_quantum=%d → %d pages → %d blocks/call, "
+            "ElasticKV: min_expand_unit=%d → %d pages → %d blocks/call, "
             "max_expand=%d blocks total "
             "(%d evictable / %d total expert pages, "
             "min_resident=%.0f%%)",
-            self.expand_group_quantum, natural_pages, natural_blocks,
+            self.min_expand_unit, natural_pages, kv_blocks_per_expand,
             self.max_expand_blocks,
             evictable_pages, total_expert_pages,
             self.min_resident_ratio * 100,

@@ -160,6 +160,10 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
+        # Scheduler-step counter for step-based recency age.
+        # Incremented each scheduling round via advance_step().
+        self._current_step: int = 0
+
         # Split free queues: uncached (no hash) vs cached (has hash).
         # At init all blocks are uncached.
         self.free_uncached_queue = FreeKVCacheBlockQueue(self.blocks)
@@ -429,8 +433,11 @@ class BlockPool:
 
         block_hash = block.block_hash
         if block_hash is None:
-            # The block doesn't have hash, eviction is not needed
             return False
+
+        # Record evict age before clearing hash
+        evict_age = self._current_step - block._cached_free_step
+        self._record_recency_age(evict_age, kind='evict')
 
         if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
             # block not found in cached_block_hash_to_block,
@@ -467,12 +474,71 @@ class BlockPool:
             # candidate), so remove it from the correct queue.
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is not None:
+                    recency_age = (self._current_step
+                                   - block._cached_free_step)
                     self.free_cached_queue.remove(block)
+                    self._record_recency_age(recency_age)
                 else:
                     self.free_uncached_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+
+    def _record_recency_age(self, age: int, kind: str = 'hit') -> None:
+        """Accumulate recency age stats.
+
+        Args:
+            age: scheduler step delta at event time.
+            kind: 'hit' (touch/reuse) or 'evict' (reclaim without reuse).
+        """
+        attr = f'_ra_{kind}'
+        s = getattr(self, f'{attr}_sum', 0) + age
+        m = max(getattr(self, f'{attr}_max', 0), age)
+        c = getattr(self, f'{attr}_count', 0) + 1
+        setattr(self, f'{attr}_sum', s)
+        setattr(self, f'{attr}_max', m)
+        setattr(self, f'{attr}_count', c)
+
+    @property
+    def recency_age_stats(self) -> dict:
+        """Recency age stats: hit (touch) and evict (reclaim) separately."""
+        result = {}
+        for kind in ('hit', 'evict'):
+            attr = f'_ra_{kind}'
+            count = getattr(self, f'{attr}_count', 0)
+            if count == 0:
+                result[kind] = {'mean': 0, 'max': 0, 'count': 0}
+            else:
+                result[kind] = {
+                    'mean': getattr(self, f'{attr}_sum', 0) / count,
+                    'max': getattr(self, f'{attr}_max', 0),
+                    'count': count,
+                }
+        return result
+
+    def advance_step(self) -> None:
+        """Advance the scheduler-step counter.
+
+        Called once per scheduling round from the scheduler.  This ensures
+        step-based recency age grows even when no blocks are freed/appended
+        (e.g. during livelock with running=0).
+        """
+        self._current_step += 1
+
+    @property
+    def front_step_age(self) -> float:
+        """Step-based recency age of the LRU front block (reclaim candidate).
+
+        Returns current_step - block._cached_free_step for the oldest cached
+        block, or 0 if the cached queue is empty.
+        """
+        cq = self.free_cached_queue
+        if cq.num_free_blocks == 0:
+            return 0.0
+        front = cq.fake_free_list_head.next_free_block
+        if front is None or front is cq.fake_free_list_tail:
+            return 0.0
+        return float(self._current_step - front._cached_free_step)
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
@@ -495,6 +561,10 @@ class BlockPool:
         if uncached_to_free:
             self.free_uncached_queue.append_n(uncached_to_free)
         if cached_to_free:
+            # Stamp scheduler step for step-based recency age
+            step = self._current_step
+            for block in cached_to_free:
+                block._cached_free_step = step
             self.free_cached_queue.append_n(cached_to_free)
 
     def evict_blocks(self, block_ids: set[int]) -> None:

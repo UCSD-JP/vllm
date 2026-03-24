@@ -648,6 +648,7 @@ class FusedMoE(CustomOp):
         self._cache_map: torch.Tensor | None = None  # persistent [global_E] → slot
         self._routing_snapshot: torch.Tensor | None = None  # topk_ids capture
         self._routing_len: torch.Tensor | None = None  # valid routing length
+        self._snapshot_active: bool = False  # set by model_runner per step
 
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
@@ -1652,7 +1653,9 @@ class FusedMoE(CustomOp):
 
         # Elastic KV: capture routing snapshot for next-step prediction.
         # This runs inside CUDA graph — uses persistent buffers.
-        if (self._expert_cache is not None
+        # _snapshot_active is set per-step by model_runner; False when
+        # dormant (no evicted experts) to avoid redundant torch.topk.
+        if (self._snapshot_active
                 and self._routing_snapshot is not None):
             # router_logits shape: [num_tokens, num_experts]
             # topk_ids would be computed from router_logits

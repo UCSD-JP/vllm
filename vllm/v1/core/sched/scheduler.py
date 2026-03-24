@@ -296,7 +296,15 @@ class Scheduler(SchedulerInterface):
             self._elastic_kv_trace_file = None
 
         from vllm.v1.core.prefix_protect import PrefixProtectionConfig
+        from vllm.v1.metrics.stats import CachingMetrics
         self._prefix_protection_config = PrefixProtectionConfig.from_env()
+        self._pp_caching_metrics = CachingMetrics(max_recent_requests=500)
+        # Per-decision cost distribution (periodic logging)
+        self._pp_step_counter = 0
+        self._pp_diag_interval = int(
+            os.environ.get("VLLM_PP_DIAG_INTERVAL", "100"))
+        self._pp_decision_stats: dict[str, list] = {}  # decision -> [(Ce,Cc,Cp)]
+        self._pp_uncached_ok_count = 0
         if self._prefix_protection_config.enable:
             self._prefix_protection_config.block_size = self.block_size
             # Propagate Ce runtime params from ElasticKVConfig
@@ -383,24 +391,66 @@ class Scheduler(SchedulerInterface):
     # │                    │ pop from.                                │
     # └────────────────────┴──────────────────────────────────────────┘
 
+    def _actual_preempt_victim_tokens(self) -> int:
+        """Get computed_tokens of the actual preemption victim.
+
+        Returns the num_computed_tokens of the request that the scheduler
+        would preempt next, matching the real preemption policy:
+        - Priority: max(running, key=(priority, arrival_time))
+        - FIFO: running[-1] (last = most recent)
+
+        This eliminates the Cp estimation ↔ actual victim mismatch.
+        Returns 0 if no running requests.
+        """
+        if not self.running:
+            return 0
+        if self.policy == SchedulingPolicy.PRIORITY:
+            victim = max(
+                self.running,
+                key=lambda r: (r.priority, r.arrival_time),
+            )
+        else:
+            victim = self.running[-1]
+        return victim.num_computed_tokens
+
+    def _get_prefix_hit_rate(self) -> float:
+        """Sliding-window prefix cache hit rate for dynamic Cc."""
+        metrics = getattr(self, '_pp_caching_metrics', None)
+        if metrics is None or metrics.aggregated_requests == 0:
+            return 0.5  # warm start
+        total = metrics.aggregated_query_total
+        if total == 0:
+            return 0.5
+        return metrics.aggregated_query_hit / total
+
     def _prefix_protection_try_allocate(
-        self, request, num_new_tokens, **alloc_kwargs
+        self, request, num_new_tokens,
+        caller=None,
+        **alloc_kwargs
     ):
-        """V3 3-way prefix protection + elastic expand + allocate.
+        """V3.1 prefix protection + elastic expand + allocate.
 
         Decision flow:
           1. Compute plan (uncached_only attempt for plan values).
           2. If uncached suffices → UNCACHED_ONLY alloc → done.
-          3. Compute V3 costs (Ce, Cc, Cp) and decide().
+          3. Compute V3.1 costs (Ce, Cc, Cp) with caller-aware model.
           4. Execute decision:
              - PROTECT_AND_EXPAND → expand + UNCACHED_ONLY retry
              - RECLAIM_CACHED → UNCACHED_THEN_CACHED alloc
-             - PREEMPT → return None (caller preempts)
+             - PREEMPT → return None (running: caller preempts)
+          WAITING path is work-conserving: no DEFER, always action or fail.
+
+        Args:
+            caller: CallerKind.RUNNING or CallerKind.WAITING.
 
         Returns:
             KVCacheBlocks or None.
         """
-        from vllm.v1.core.prefix_protect import ProtectionDecision
+        from vllm.v1.core.prefix_protect import (
+            CallerKind, ProtectionDecision)
+
+        if caller is None:
+            caller = CallerKind.RUNNING
 
         mgr = self.kv_cache_manager
         prefix_protection_active = (
@@ -430,20 +480,22 @@ class Scheduler(SchedulerInterface):
                         request, num_new_tokens, **alloc_kwargs)
             return None
 
-        # --- V3 Prefix protection path ---
+        # --- V3.1 Prefix protection path ---
 
         # Step 1: try uncached-only (also computes plan)
         attempt = mgr.try_allocate(
             request, num_new_tokens,
             alloc_mode="uncached_only", **alloc_kwargs)
         if attempt.blocks is not None:
+            self._pp_uncached_ok_count = getattr(
+                self, '_pp_uncached_ok_count', 0) + 1
             return attempt.blocks  # USE_UNCACHED: all from uncached
 
         plan = attempt.plan
         protection_gap = plan.protection_gap
         touched = plan.touched_cached_blocks
 
-        # Step 2: compute V3 cost inputs
+        # Step 2: compute V3.1 cost inputs
         h_eff = self._compute_h_eff()
         n_prefill = sum(1 for r in self.running
                         if r.num_output_tokens == 0)
@@ -463,9 +515,6 @@ class Scheduler(SchedulerInterface):
             groups_est = 1
 
         # can_fully_protect: partial expand prevention.
-        # NOTE: this is a cap-based heuristic — even when True, the worker
-        # may deliver fewer blocks than requested (VMM/eviction limits).
-        # If expand under-delivers, we fall back to RECLAIM_CACHED below.
         remaining_cap = (
             cfg.max_expand_blocks - self._elastic_kv_expanded_total
             if cfg is not None and cfg.max_expand_blocks > 0
@@ -474,33 +523,48 @@ class Scheduler(SchedulerInterface):
             hasattr(self, '_elastic_kv_handler')
             and remaining_cap >= protection_gap)
 
-        # Preempt cost: worst candidate (single-candidate heuristic)
-        preempt_tokens = 0
-        if self.running:
-            preempt_tokens = min(
-                r.num_computed_tokens for r in self.running)
+        # Preempt cost: compute for both callers (waiting can preempt too
+        # if running > 0).  Returns 0 when running is empty.
+        preempt_tokens = self._actual_preempt_victim_tokens()
 
-        # Step 3: V3 3-way decision
+        # Dynamic hit rate for Cc
+        hit_rate = self._get_prefix_hit_rate()
+
+        # Recency age for Cc cold-block decay — step-based, uses front of
+        # cached queue (the actual reclaim candidate, oldest block).
+        # Step-based age advances even during livelock (no block churn).
+        recency_age = 0.0
+        pool = getattr(mgr, 'block_pool', None)
+        if pool is not None:
+            recency_age = pool.front_step_age
+
+        # Step 3: Work-conserving decision with caller
         pp_cfg = self._prefix_protection_config
         decision = pp_cfg.decide(
             h_eff=h_eff, groups_to_evict=groups_est,
             touched_cached_blocks=touched,
             preempt_computed_tokens=preempt_tokens,
             n_decode=n_decode, n_prefill=n_prefill,
-            can_fully_protect=can_fully_protect)
+            can_fully_protect=can_fully_protect,
+            caller=caller,
+            hit_rate=hit_rate,
+            recency_age=recency_age)
 
         # Compute costs for trace/logging
         ce_val = pp_cfg.compute_ce(h_eff, groups_est, n_decode, n_prefill)
-        cc_val = pp_cfg.compute_cc(touched)
-        cp_val = pp_cfg.compute_cp(preempt_tokens)
+        cc_val = pp_cfg.compute_cc(touched, hit_rate=hit_rate,
+                                   recency_age=recency_age)
+        cp_val = pp_cfg.compute_cp_running(preempt_tokens)
 
         logger.debug(
-            "pp_decide: decision=%s, required=%d, uncached=%d, cached=%d, "
-            "touched=%d, h_eff=%d, groups=%d, Ce=%.0f Cc=%.0f Cp=%.0f, "
+            "pp_decide: decision=%s, caller=%s, required=%d, uncached=%d, "
+            "cached=%d, touched=%d, h_eff=%d, groups=%d, "
+            "Ce=%.0f Cc=%.0f Cp=%.0f, hit_rate=%.3f, "
             "can_protect=%s, remaining_cap=%.0f",
-            decision.value, plan.required_blocks, plan.noncached_free,
+            decision.value, caller.value,
+            plan.required_blocks, plan.noncached_free,
             plan.cached_free, touched, h_eff, groups_est,
-            ce_val, cc_val, cp_val,
+            ce_val, cc_val, cp_val, hit_rate,
             can_fully_protect, remaining_cap,
         )
 
@@ -512,9 +576,20 @@ class Scheduler(SchedulerInterface):
             can_fully_protect=can_fully_protect,
             remaining_cap=remaining_cap,
             decision=decision, preempt_tokens=preempt_tokens,
+            caller=caller, hit_rate=hit_rate,
         )
 
+        # Record cost distribution for periodic diag
+        stats = getattr(self, '_pp_decision_stats', None)
+        if stats is not None:
+            dec_key = decision.value
+            stats.setdefault(dec_key, []).append(
+                (ce_val, cc_val, cp_val))
+
         # Step 4: execute decision
+        if decision == ProtectionDecision.PREEMPT:
+            return None
+
         if decision == ProtectionDecision.PROTECT_AND_EXPAND:
             added = self._try_elastic_kv_expand(protection_gap)
             if added >= protection_gap:
@@ -525,8 +600,7 @@ class Scheduler(SchedulerInterface):
                 if new_blocks is not None:
                     return new_blocks
             # Expand insufficient (worker under-delivered) →
-            # fallback to RECLAIM_CACHED.  This is expected when VMM or
-            # expert eviction limits prevent full expand.
+            # fallback to RECLAIM_CACHED.
             logger.warning(
                 "pp: expand partial (%d/%d), fallback to reclaim_cached",
                 added, protection_gap)
@@ -549,7 +623,6 @@ class Scheduler(SchedulerInterface):
                         alloc_mode="uncached_then_cached", **alloc_kwargs)
             return None
 
-        # PREEMPT: return None → caller's preemption loop handles it
         return None
 
     def _trace_decision(self, **kwargs) -> None:
@@ -582,8 +655,23 @@ class Scheduler(SchedulerInterface):
         decision = kwargs.get('decision')
         record['decision'] = decision.value if decision else ''
         record['preempt_tokens'] = kwargs.get('preempt_tokens', 0)
-        # Runtime config for accurate offline replay
+        caller = kwargs.get('caller')
+        record['caller'] = caller.value if caller else ''
+        hit_rate = kwargs.get('hit_rate')
+        record['hit_rate'] = hit_rate
         pp_cfg = getattr(self, '_prefix_protection_config', None)
+        if hit_rate is not None and pp_cfg is not None:
+            if pp_cfg.p_reuse_alpha > 0:
+                record['p_reuse_eff'] = pp_cfg.p_reuse_alpha * hit_rate
+            else:
+                record['p_reuse_eff'] = pp_cfg.p_reuse  # static fallback
+        # Recency age stats
+        mgr = getattr(self, 'kv_cache_manager', None)
+        if mgr is not None:
+            pool = getattr(mgr, 'block_pool', None)
+            if pool is not None:
+                record['recency_age'] = pool.recency_age_stats
+        # Runtime config for accurate offline replay
         if pp_cfg is not None:
             record['cfg'] = {
                 'E': pp_cfg.local_num_experts,
@@ -597,6 +685,8 @@ class Scheduler(SchedulerInterface):
                 't_recompute': pp_cfg.t_recompute_ms_per_token,
                 't_prefill_tok_us': pp_cfg.t_prefill_tok_us,
                 'p_reuse': pp_cfg.p_reuse,
+                'p_reuse_alpha': pp_cfg.p_reuse_alpha,
+                'cc_age_scale': pp_cfg.cc_age_scale,
             }
         try:
             trace_file.write(json.dumps(record) + '\n')
@@ -675,7 +765,58 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _pp_periodic_diag(self) -> None:
+        """Emit periodic diagnostic log with decision cost distribution."""
+        counter = getattr(self, '_pp_step_counter', 0) + 1
+        self._pp_step_counter = counter
+        interval = getattr(self, '_pp_diag_interval', 100)
+        if interval <= 0 or counter % interval != 0:
+            return
+        mgr = self.kv_cache_manager
+        pool = getattr(mgr, 'block_pool', None)
+        uncached_free = (pool.free_uncached_queue.num_free_blocks
+                         if pool else 0)
+        cached_free = (pool.free_cached_queue.num_free_blocks
+                       if pool else 0)
+        expanded = getattr(self, '_elastic_kv_expanded_total', 0)
+        hit_rate = self._get_prefix_hit_rate()
+        n_running = len(self.running)
+        n_waiting = len(self.waiting)
+        uc_ok = getattr(self, '_pp_uncached_ok_count', 0)
+        stats = getattr(self, '_pp_decision_stats', {})
+
+        parts = [f"step={counter}",
+                 f"running={n_running}",
+                 f"waiting={n_waiting}",
+                 f"uncached_free={uncached_free}",
+                 f"cached_free={cached_free}",
+                 f"expanded={expanded}",
+                 f"hit_rate={hit_rate:.3f}",
+                 f"uc_ok={uc_ok}"]
+        for dec, costs in sorted(stats.items()):
+            n = len(costs)
+            if n == 0:
+                continue
+            ce_avg = sum(c[0] for c in costs) / n
+            cc_avg = sum(c[1] for c in costs) / n
+            cp_avg = sum(c[2] for c in costs) / n
+            parts.append(
+                f"{dec}={n}(Ce={ce_avg:.0f},Cc={cc_avg:.0f},Cp={cp_avg:.0f})")
+        logger.info("[PP-DIAG] %s", " | ".join(parts))
+
+        # Reset counters for next interval
+        self._pp_uncached_ok_count = 0
+        self._pp_decision_stats = {}
+
     def schedule(self) -> SchedulerOutput:
+        # Advance step counter for step-based recency age (PP Cc decay).
+        # Must advance even when no blocks churn (livelock scenario).
+        pool = getattr(getattr(self, 'kv_cache_manager', None),
+                       'block_pool', None)
+        if pool is not None:
+            pool.advance_step()
+
+        self._pp_periodic_diag()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -793,9 +934,11 @@ class Scheduler(SchedulerInterface):
                 while True:
                     # Prefix protection: uses exact deficit from coordinator,
                     # strict uncached allocation, and Ce/Cp cost model.
+                    from vllm.v1.core.prefix_protect import CallerKind
                     new_blocks = self._prefix_protection_try_allocate(
                         request,
                         num_new_tokens,
+                        caller=CallerKind.RUNNING,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
 
@@ -1075,9 +1218,11 @@ class Scheduler(SchedulerInterface):
 
                 # Prefix protection: uses exact deficit from coordinator,
                 # strict uncached allocation, and Ce/Cp cost model.
+                from vllm.v1.core.prefix_protect import CallerKind
                 new_blocks = self._prefix_protection_try_allocate(
                     request,
                     num_new_tokens,
+                    caller=CallerKind.WAITING,
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
@@ -2144,6 +2289,12 @@ class Scheduler(SchedulerInterface):
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
+        # Feed current batch stats to PP's CachingMetrics before reset
+        pp_metrics = getattr(self, '_pp_caching_metrics', None)
+        if pp_metrics is not None:
+            raw_stats = self.kv_cache_manager.prefix_cache_stats
+            if raw_stats is not None:
+                pp_metrics.observe(raw_stats)
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
         assert prefix_cache_stats is not None
         connector_prefix_cache_stats = self._make_connector_prefix_cache_stats()

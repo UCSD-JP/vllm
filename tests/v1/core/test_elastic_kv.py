@@ -293,7 +293,7 @@ class TestElasticKVConfig:
         config = ElasticKVConfig(
             enable=True,
             min_resident_ratio=0.5,
-            expand_group_quantum=4,
+            min_expand_unit=4,
         )
 
         # Mock pool: 256 expert pages (50% evictable = 128 pages → 128 blocks)
@@ -663,3 +663,110 @@ class TestElasticKVConfigCeParams:
         # Ce params are runtime-only, should be 0
         assert cfg.local_num_experts == 0
         assert cfg.expert_top_k == 0
+
+
+# ---------------------------------------------------------------------------
+# Recency Age Tracking
+# ---------------------------------------------------------------------------
+
+class TestRecencyAgeTracking:
+    """Tests for recency age tracking on touch()."""
+
+    def _make_pool(self, num_blocks=21):
+        from vllm.v1.core.block_pool import BlockPool
+        return BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=True,
+            hash_block_size=16,
+        )
+
+    def _move_to_cached(self, pool, count):
+        """Pop from uncached, set hash, stamp step, put in cached queue."""
+        blocks = pool.free_uncached_queue.popleft_n(count)
+        step = pool._current_step
+        for i, b in enumerate(blocks):
+            b._block_hash = b'hash' + i.to_bytes(4, 'big')
+            b._cached_free_step = step
+        pool.free_cached_queue.append_n(blocks)
+        return blocks
+
+    def test_recency_age_hit_tracking(self):
+        """touch() records hit age using scheduler step delta."""
+        pool = self._make_pool(21)  # 20 free after null
+        cached = self._move_to_cached(pool, 5)  # stamped at step 0
+        # Advance steps to simulate scheduler rounds
+        for _ in range(3):
+            pool.advance_step()
+
+        pool.touch([cached[0]])
+
+        stats = pool.recency_age_stats
+        assert stats['hit']['count'] == 1
+        assert stats['hit']['mean'] == 3  # 3 steps since stamp
+        assert stats['hit']['max'] == 3
+
+    def test_recency_age_step_based(self):
+        """Step-based age: blocks stamped at different steps have correct age."""
+        pool = self._make_pool(21)
+        # Stamp batch 1 at step 0
+        batch1 = self._move_to_cached(pool, 2)
+        # Advance 5 steps
+        for _ in range(5):
+            pool.advance_step()
+        # Stamp batch 2 at step 5
+        batch2 = self._move_to_cached(pool, 2)
+        # Advance 3 more steps → now at step 8
+        for _ in range(3):
+            pool.advance_step()
+
+        # Touch one from each batch
+        pool.touch([batch1[0]])  # age = 8 - 0 = 8
+        pool.touch([batch2[0]])  # age = 8 - 5 = 3
+
+        stats = pool.recency_age_stats
+        assert stats['hit']['count'] == 2
+        assert stats['hit']['mean'] == 5.5  # (8 + 3) / 2
+        assert stats['hit']['max'] == 8
+
+    def test_recency_age_empty_stats(self):
+        """No touch/evict → empty stats."""
+        pool = self._make_pool(21)
+        stats = pool.recency_age_stats
+        assert stats['hit']['count'] == 0
+        assert stats['evict']['count'] == 0
+
+    def test_front_step_age_returns_oldest_block_age(self):
+        """front_step_age returns step-based age of the LRU front."""
+        pool = self._make_pool(21)
+        # Move 5 blocks to cached queue at step 0
+        cached = self._move_to_cached(pool, 5)
+
+        # Advance 10 steps
+        for _ in range(10):
+            pool.advance_step()
+
+        # front_step_age = current_step(10) - front._cached_free_step(0)
+        assert pool.front_step_age == 10.0
+
+        # Advance more → age grows even without block churn
+        for _ in range(5):
+            pool.advance_step()
+        assert pool.front_step_age == 15.0
+
+    def test_front_step_age_empty_queue(self):
+        """front_step_age returns 0 for empty cached queue."""
+        pool = self._make_pool(21)
+        assert pool.front_step_age == 0.0
+
+    def test_step_age_grows_during_livelock(self):
+        """Step-based age grows even when no blocks are freed (livelock)."""
+        pool = self._make_pool(21)
+        cached = self._move_to_cached(pool, 3)  # at step 0
+
+        # Simulate livelock: advance steps without any block operations
+        for _ in range(100):
+            pool.advance_step()
+
+        # Age should be 100 even though no blocks were freed/appended
+        assert pool.front_step_age == 100.0
+        assert pool._current_step == 100
