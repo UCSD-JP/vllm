@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Prefix Protection hard protect design.
+"""Unit tests for Prefix Protection V4 cost model.
 
 Tests cover:
 1. Hard protect regression (most important)
-2. Ce/Cp dynamic cost model
+2. Ce/Cc/Cp dynamic cost model (V4 traffic-bound Ce)
 3. _pop_uncached_only correctness
 4. AllocationPlan/AllocationAttempt
-5. PrefixProtectionConfig.should_protect logic
-6. ElasticKVConfig runtime geometry
-7. Dynamic groups calculation
-8. Engine exact target commit
+5. ElasticKVConfig runtime geometry
+6. Dynamic groups calculation
+7. Engine exact target commit
 """
 
 import math
@@ -24,23 +23,22 @@ from vllm.v1.core.prefix_protect import PrefixProtectionConfig
 # =====================================================================
 
 class TestPrefixProtectionConfig:
-    """Tests for V3 3-way cost model.
+    """Tests for V4 3-way cost model (traffic-bound Ce).
 
     Terminology:
-      Ce = Cost_expert_evict (reloading evicted experts during decode)
+      Ce = Cost_expert_evict — top_k × rho × c_reload × h_eff × 1000
+           rho = (groups × G) / E  (fraction of experts evicted)
       Cc = Cost_cached_reclaim (re-prefilling destroyed prefix cache)
-      Cp = Cost_req_preempt (recomputing preempted request tokens)
+      Cp = Cost_req_preempt (partial-tail model for running victims)
       h_eff = effective remaining decode steps
       groups_to_evict = expert groups to evict for expansion
-      n_decode / n_prefill = batch composition
     """
 
     def _default_cfg(self, **overrides):
         """Create config with test-friendly defaults."""
         kw = dict(
             local_num_experts=512, group_size=2, top_k=10,
-            c_reload_ms=0.63, num_layers=1, h_cap=64,
-            l_sync_prefill=2.0,
+            c_reload_ms=0.63, h_cap=64,
             t_recompute_ms_per_token=0.260,
             block_size=16, t_prefill_tok_us=15.0,
             p_reuse=1.0, t_sched_us=500.0, t_queue_us=1000.0,
@@ -51,20 +49,19 @@ class TestPrefixProtectionConfig:
     # --- Ce tests ---
 
     def test_compute_ce_basic(self):
-        """Ce with small batch, h_eff=10, groups=4."""
-        cfg = self._default_cfg()
-        # k_per_layer = 4/1 = 4
-        # m_eff = 10 * (6 + 2.0*2) = 100
-        # P_hit_one = 1 - (1 - 2/512)^100 ≈ 0.3236
-        # stall_step = 4 * 0.3236 * 0.63 = 0.8155
-        # Ce = 0.8155 * 10 * 1000 = 8155 µs
+        """V4 Ce: traffic-bound DMA model, h_eff=10, groups=4."""
+        cfg = self._default_cfg()  # h_cap=64 in tests
+        # rho = (4 × 2) / 512 = 0.015625
+        # stall_per_token_ms = 10 × 0.015625 × 0.63 = 0.0984375
+        # Ce = 0.0984375 × 10 × 1000 = 984.375 µs
         ce = cfg.compute_ce(h_eff=10, groups_to_evict=4,
                             n_decode=6, n_prefill=2)
-        assert ce > 0
-        # Verify formula structure: should increase with h_eff
+        assert ce == pytest.approx(984.375)
+        # linear in h_eff
         ce_higher_h = cfg.compute_ce(h_eff=50, groups_to_evict=4,
                                      n_decode=6, n_prefill=2)
         assert ce_higher_h > ce
+        assert ce_higher_h == pytest.approx(ce * 5)
 
     def test_compute_ce_zero_groups(self):
         """Zero groups → Ce = 0."""
@@ -122,25 +119,10 @@ class TestPrefixProtectionConfig:
         cfg = self._default_cfg()
         assert cfg.compute_cp_running(0) == 0.0
 
-    def test_backward_compat_compute_cp(self):
-        """compute_cp() → compute_cp_running() backward compat."""
-        cfg = self._default_cfg()
-        assert cfg.compute_cp(49) == cfg.compute_cp_running(49)
-        assert cfg.compute_cp(48) == cfg.compute_cp_running(48)
-        assert cfg.compute_cp(0) == cfg.compute_cp_running(0)
-
-    # Legacy Cp test (still useful for coverage)
-    def test_compute_cp_basic(self):
-        """Cp for 2048 computed tokens (not block-aligned → finite)."""
-        cfg = self._default_cfg()
-        cp = cfg.compute_cp(2048)
-        # 2048 % 16 = 0 → inf (V3.1 partial-tail model)
-        assert cp == float('inf')
-
-    def test_compute_cp_zero(self):
-        """Cp for 0 tokens = 0."""
-        cfg = self._default_cfg()
-        assert cfg.compute_cp(0) == 0.0
+    def test_compute_cp_running_large_aligned(self):
+        """2048 tokens, block_size=16: partial=0 → inf."""
+        cfg = self._default_cfg(block_size=16)
+        assert cfg.compute_cp_running(2048) == float('inf')
 
     # --- decide() tests ---
 
@@ -335,20 +317,20 @@ class TestPrefixProtectionConfig:
                         f"got {d} for touched={touched}, "
                         f"protect={protect}, pt={pt}")
 
-    def test_decide_waiting_preempt_when_running_available(self):
-        """WAITING + Cp cheapest + running>0 → PREEMPT (not stuck)."""
+    def test_decide_waiting_never_preempts(self):
+        """WAITING never returns PREEMPT — always Ce vs Cc for progress."""
         from vllm.v1.core.prefix_protect import (
             CallerKind, ProtectionDecision)
         cfg = self._default_cfg()
-        # preempt_tokens=49 (partial=1) → Cp very cheap
-        # Ce=inf (can_fully_protect=False), Cc for 100 blocks = high
+        # Even when Cp is cheapest, WAITING picks min(Ce, Cc)
+        # Ce=inf (can_fully_protect=False) → RECLAIM_CACHED
         d = cfg.decide(h_eff=50, groups_to_evict=20,
                        touched_cached_blocks=100,
                        preempt_computed_tokens=49,
                        n_decode=20, n_prefill=5,
                        can_fully_protect=False,
                        caller=CallerKind.WAITING)
-        assert d == ProtectionDecision.PREEMPT
+        assert d == ProtectionDecision.RECLAIM_CACHED
 
     def test_decide_waiting_reclaim_when_no_running(self):
         """WAITING + Cp cheapest but running=0 → RECLAIM (fallback)."""
@@ -601,7 +583,7 @@ class TestHardProtectRegression:
         """Small batch: Ce is low, Cc for gap=3 is moderate → protect."""
         cfg = PrefixProtectionConfig(
             top_k=10, group_size=2, local_num_experts=512,
-            c_reload_ms=0.63, h_cap=64, num_layers=1,
+            c_reload_ms=0.63, h_cap=64,
             block_size=16, t_prefill_tok_us=15.0,
             t_sched_us=500.0, t_queue_us=1000.0,
             p_reuse=1.0, enable=True,

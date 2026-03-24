@@ -1,27 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefix Protection V3 cost model — work-conserving decision (Ce / Cc / Cp).
+"""Prefix Protection V4 cost model — work-conserving decision (Ce / Cc / Cp).
 
-Ce = Cost_expert_evict  — reloading evicted experts during decode
+Ce = Cost_expert_evict  — per-token DMA reload stall from evicted experts
 Cc = Cost_cached_reclaim — re-prefilling destroyed prefix cache blocks
-Cp = Cost_req_preempt   — recomputing preempted request tokens (RUNNING only)
+Cp = Cost_req_preempt   — recomputing preempted request tokens
 
 Decision:
   USE_UNCACHED         — uncached free blocks suffice, no cost
   PROTECT_AND_EXPAND   — Ce is cheapest: expand KV via expert eviction
   RECLAIM_CACHED       — Cc is cheapest: reclaim cached blocks
-  PREEMPT              — Cp is cheapest: preempt a running request (RUNNING only)
+  PREEMPT              — Cp is cheapest: preempt a running request
 
-WAITING path is strictly work-conserving: Ce vs Cc comparison only.
-Fallback is RECLAIM_CACHED (always progress or allocation failure).
-DEFER was removed — it caused non-work-conserving stagnation.
+WAITING path is strictly work-conserving.
+Fallback is RECLAIM_CACHED (always progress, no DEFER).
 
-V3 formulas (VAMP_V3_TWO_LAYER_DESIGN.md):
-  Ce = stall_step × H_eff
-    stall_step = k_per_layer × P_hit_one × C_reload
-    P_hit_one  = 1 − (1 − G/E)^m_eff
-    m_eff      = top_k × (N_decode + L_sync × N_prefill)
-  Cp = N_computed × t_recompute_ms_per_token × 1000  (→ µs)
-  Cc = p_reuse × (touched_blocks × block_size × t_prefill_tok_us + overhead)
+V4 Ce (traffic-bound, per-token amortized):
+  rho  = (groups_to_evict × G) / E        — miss rate (uniform routing)
+  Ce   = top_k × rho × c_reload × h_eff × 1000   (ms → µs)
+
+  Physical basis: expert reload is DMA I/O → stall ∝ miss count.
+  Per-step stall = batch × per-token stall; per-request share = stall / batch
+  → batch cancels out (amortized).
+
+Cc = p_reuse × (touched_blocks × block_size × t_prefill_tok + overhead)
+Cp = t_sched + t_queue + partial_tail_tokens × t_prefill_tok
 """
 
 from __future__ import annotations
@@ -47,14 +49,12 @@ class ProtectionDecision(Enum):
 class PrefixProtectionConfig:
     """V3 3-way prefix protection cost model configuration."""
 
-    # --- Ce parameters (V3 Expected Hit Groups) ---
+    # --- Ce parameters (V4 traffic-bound) ---
     local_num_experts: int = 512   # E: number of local experts
     group_size: int = 2            # G: experts per group
-    top_k: int = 10                # top_k_eff
+    top_k: int = 10                # top_k per token
     c_reload_ms: float = 0.63     # C_reload per expert (ms, topology dep.)
-    num_layers: int = 1            # L_local
-    h_cap: int = 64                # H_cap
-    l_sync_prefill: float = 2.0   # L_sync_prefill weight
+    h_cap: int = 16                # H_cap (remaining decode steps clamp)
 
     # --- Cp parameters ---
     t_recompute_ms_per_token: float = 0.260  # ms/tok (V3 t_recompute)
@@ -82,10 +82,7 @@ class PrefixProtectionConfig:
                 os.environ.get("VLLM_PP_NUM_EXPERTS", "512")),
             c_reload_ms=float(
                 os.environ.get("VLLM_PP_C_RELOAD_MS", "0.63")),
-            h_cap=int(os.environ.get("VLLM_PP_H_CAP", "64")),
-            num_layers=int(os.environ.get("VLLM_PP_NUM_LAYERS", "1")),
-            l_sync_prefill=float(
-                os.environ.get("VLLM_PP_L_SYNC_PREFILL", "2.0")),
+            h_cap=int(os.environ.get("VLLM_PP_H_CAP", "16")),
             t_recompute_ms_per_token=float(
                 os.environ.get("VLLM_PP_T_RECOMPUTE", "0.260")),
             block_size=int(os.environ.get("VLLM_PP_BLOCK_SIZE", "16")),
@@ -101,28 +98,28 @@ class PrefixProtectionConfig:
         )
 
     # ------------------------------------------------------------------ #
-    # V3 cost functions
+    # V4 cost functions
     # ------------------------------------------------------------------ #
 
     def compute_ce(self, h_eff: int, groups_to_evict: int,
-                   n_decode: int, n_prefill: int) -> float:
-        """V3 Cost_expert_evict (microseconds).
+                   n_decode: int = 0, n_prefill: int = 0) -> float:
+        """V4 Cost_expert_evict — traffic-bound DMA model (microseconds).
 
-        stall_step = k_per_layer × P_hit_one × C_reload
-        P_hit_one  = 1 − (1 − G/E)^m_eff
-        m_eff      = top_k × (N_decode + L_sync × N_prefill)
-        Ce         = stall_step × H_eff × 1000  (ms → µs)
+        rho  = (groups_to_evict × G) / E   — fraction of experts evicted
+        Ce   = top_k × rho × c_reload × h_eff × 1000
+
+        Per-token: top_k experts routed, each has rho probability of
+        being evicted (uniform routing).  Each miss = c_reload ms DMA.
+        Batch cancels via amortization (see module docstring).
         """
         E = self.local_num_experts
         G = self.group_size
         if E <= 0 or groups_to_evict <= 0:
             return 0.0
 
-        k_per_layer = groups_to_evict / max(1, self.num_layers)
-        m_eff = self.top_k * (n_decode + self.l_sync_prefill * n_prefill)
-        p_hit_one = 1.0 - (1.0 - G / E) ** m_eff if m_eff > 0 else 0.0
-        stall_step = k_per_layer * p_hit_one * self.c_reload_ms
-        return stall_step * h_eff * 1000  # → µs
+        rho = min((groups_to_evict * G) / E, 1.0)  # clamp: can't evict > 100%
+        stall_per_token_ms = self.top_k * rho * self.c_reload_ms
+        return stall_per_token_ms * h_eff * 1000  # ms → µs
 
     def compute_cc(self, touched_cached_blocks: int,
                    hit_rate: float | None = None,
@@ -141,7 +138,6 @@ class PrefixProtectionConfig:
             age=0     → p_eff = p (fresh, full cost)
             age=2000  → p_eff = p × 0.50 (half-life)
             age=14000 → p_eff = p × 0.125 (Ce-competitive)
-            age=18k   → p_eff = p × 0.10 (cold tail, Cc ≈ Ce)
         """
         if touched_cached_blocks <= 0:
             return 0.0
@@ -178,12 +174,8 @@ class PrefixProtectionConfig:
         return (self.t_sched_us + self.t_queue_us
                 + partial_tail_tokens * self.t_prefill_tok_us)
 
-    def compute_cp(self, preempt_computed_tokens: int) -> float:
-        """Backward-compat wrapper -> compute_cp_running."""
-        return self.compute_cp_running(preempt_computed_tokens)
-
     # ------------------------------------------------------------------ #
-    # V3 3-way decision
+    # V4 3-way decision
     # ------------------------------------------------------------------ #
 
     def decide(self, h_eff: int, groups_to_evict: int,
@@ -242,23 +234,9 @@ class PrefixProtectionConfig:
         if caller == CallerKind.RUNNING:
             return ProtectionDecision.PREEMPT
         else:
-            # WAITING: Cp won but fallback is RECLAIM_CACHED
-            # (work-conserving — no idle deferral).
-            # If running > 0, preemption is viable.
-            if preempt_computed_tokens > 0:
-                return ProtectionDecision.PREEMPT
+            # WAITING: PREEMPT = skip (no blocks freed for this request).
+            # Always pick the cheaper of Ce vs Cc to make progress.
+            if Ce <= Cc:
+                return ProtectionDecision.PROTECT_AND_EXPAND
             return ProtectionDecision.RECLAIM_CACHED
 
-    # ------------------------------------------------------------------ #
-    # Legacy compatibility: should_protect() for existing callers
-    # ------------------------------------------------------------------ #
-
-    def should_protect(self, b_eff: int, h_eff: int,
-                       groups_to_evict: int,
-                       protection_gap: int = 1) -> bool:
-        """Legacy 2-way: Ce < Cp means protect."""
-        if groups_to_evict <= 0:
-            return True
-        ce = self.compute_ce(h_eff, groups_to_evict, b_eff, 0)
-        cc = self.compute_cc(protection_gap)
-        return ce < cc

@@ -1,4 +1,4 @@
-# Elastic KV + Prefix Protection — V3.2c Design Document
+# Elastic KV + Prefix Protection — V4 Design Document
 
 **Base**: vLLM 0.15.1 (pinned)
 **Branch**: `elastic-kv-mvp`
@@ -24,6 +24,7 @@ Prefix Protection은 KV cache 확장 시 prefix cache(재사용 가능한 캐시
 | V3.1 | CallerKind 분리, dynamic p_reuse, recency age tracking |
 | V3.2 | Work-conserving (DEFER 제거), PREEMPT waiting 허용 |
 | V3.2c | Routing snapshot dormant fix, step-based recency age |
+| V4 | Traffic-bound Ce model (rho × top_k × c_reload), num_layers/l_sync 제거 |
 
 ---
 
@@ -92,23 +93,32 @@ Prefix Protection은 KV cache 확장 시 prefix cache(재사용 가능한 캐시
 
 ---
 
-## 3. Cost Model (Prefix Protection V3)
+## 3. Cost Model (Prefix Protection V4)
 
-### 3.1 Ce — Expert Eviction Cost
+### 3.1 Ce — Expert Eviction Cost (V4 Traffic-Bound DMA Model)
 
-KV 확장을 위해 expert를 evict하면, decode 중 해당 expert가 routing될 때 reload stall 발생.
+KV 확장을 위해 expert를 evict하면, decode 중 해당 expert가 routing될 때 DMA reload stall 발생.
+
+**V4 모델**: Expert reload는 DMA I/O → stall ∝ miss count (linear). Per-token amortized.
 
 ```
-stall_step = k_per_layer × P_hit_one × C_reload
-P_hit_one  = 1 − (1 − G/E)^m_eff
-m_eff      = top_k × (N_decode + L_sync × N_prefill)
-Ce         = stall_step × H_eff × 1000  (ms → µs)
+rho               = (groups_to_evict × G) / E   — evicted fraction
+stall_per_token   = top_k × rho × C_reload      — expected DMA per token (ms)
+Ce                = stall_per_token × H_eff × 1000   (ms → µs)
 ```
+
+**Batch cancellation**: Per-step stall = batch × per-token stall.
+Per-request share = stall / batch. Batch cancels out → per-token model is already amortized.
 
 - `E`: local expert 수 (e.g. 512)
 - `G`: group size (e.g. 2)
+- `top_k`: experts routed per token (e.g. 10)
 - `H_eff`: min remaining decode steps, clamped to [1, H_cap]
 - `can_fully_protect=False` → Ce = ∞ (partial expand 방지)
+
+예시: `groups=4, G=2, E=512, top_k=10, c_reload=0.63ms, h_eff=10`
+→ rho = 8/512 = 0.015625, stall = 10 × 0.015625 × 0.63 = 0.098ms/tok
+→ Ce = 0.098 × 10 × 1000 = 984 µs
 
 ### 3.2 Cc — Cached Block Reclaim Cost
 
@@ -278,11 +288,9 @@ Expert cache가 dormant 상태 (모든 expert가 resident)일 때, `forward_cuda
 | `VLLM_PP_CC_AGE_SCALE` | `2000.0` | Recency age half-life for Cc decay |
 | `VLLM_PP_T_SCHED` | `500.0` | Scheduler overhead (µs) |
 | `VLLM_PP_T_QUEUE` | `1000.0` | Queue overhead (µs) |
-| `VLLM_PP_L_SYNC_PREFILL` | `2.0` | Prefill sync weight for m_eff |
 | `VLLM_PP_TOP_K` | `10` | Top-k for Ce calculation |
 | `VLLM_PP_GROUP_SIZE` | `2` | Expert group size |
 | `VLLM_PP_NUM_EXPERTS` | `512` | Local expert count |
-| `VLLM_PP_NUM_LAYERS` | `1` | MoE layer count |
 | `VLLM_PP_T_RECOMPUTE` | `0.260` | Per-token recompute cost (ms) |
 | `VLLM_PP_BLOCK_SIZE` | `16` | Tokens per block |
 | `VLLM_PP_DIAG_INTERVAL` | `100` | Diagnostic log interval (steps) |

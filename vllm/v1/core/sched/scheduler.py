@@ -309,7 +309,7 @@ class Scheduler(SchedulerInterface):
             self._prefix_protection_config.block_size = self.block_size
             # Propagate Ce runtime params from ElasticKVConfig
             for attr in ('local_num_experts', 'expert_group_size',
-                         'expert_top_k', 'num_layers', 'c_reload_ms'):
+                         'expert_top_k', 'c_reload_ms'):
                 val = getattr(config, attr, None)
                 if val is not None and val > 0:
                     target_attr = attr
@@ -320,12 +320,11 @@ class Scheduler(SchedulerInterface):
                     setattr(self._prefix_protection_config, target_attr, val)
             logger.info(
                 "Prefix protection enabled: block_size=%d, "
-                "E=%d, G=%d, top_k=%d, L=%d, c_reload=%.3f ms",
+                "E=%d, G=%d, top_k=%d, c_reload=%.3f ms",
                 self._prefix_protection_config.block_size,
                 self._prefix_protection_config.local_num_experts,
                 self._prefix_protection_config.group_size,
                 self._prefix_protection_config.top_k,
-                self._prefix_protection_config.num_layers,
                 self._prefix_protection_config.c_reload_ms,
             )
 
@@ -680,9 +679,6 @@ class Scheduler(SchedulerInterface):
                 'c_reload_ms': pp_cfg.c_reload_ms,
                 'block_size': pp_cfg.block_size,
                 'h_cap': pp_cfg.h_cap,
-                'num_layers': pp_cfg.num_layers,
-                'l_sync_prefill': pp_cfg.l_sync_prefill,
-                't_recompute': pp_cfg.t_recompute_ms_per_token,
                 't_prefill_tok_us': pp_cfg.t_prefill_tok_us,
                 'p_reuse': pp_cfg.p_reuse,
                 'p_reuse_alpha': pp_cfg.p_reuse_alpha,
