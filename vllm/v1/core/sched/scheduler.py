@@ -443,7 +443,10 @@ class Scheduler(SchedulerInterface):
             caller: CallerKind.RUNNING or CallerKind.WAITING.
 
         Returns:
-            KVCacheBlocks or None.
+            (KVCacheBlocks or None, decision_str or None).
+            decision_str is the ProtectionDecision value when PP is active,
+            None otherwise.  Callers use the decision to drive preempt
+            executors without fragile shared state.
         """
         from vllm.v1.core.prefix_protect import (
             CallerKind, ProtectionDecision)
@@ -469,15 +472,15 @@ class Scheduler(SchedulerInterface):
             attempt = mgr.try_allocate(
                 request, num_new_tokens, **alloc_kwargs)
             if attempt.blocks is not None:
-                return attempt.blocks
+                return attempt.blocks, None
             if (attempt.plan.allocation_gap > 0
                     and hasattr(self, '_elastic_kv_handler')):
                 added = self._try_elastic_kv_expand(
                     attempt.plan.allocation_gap)
                 if added > 0:
-                    return mgr.allocate_slots(
-                        request, num_new_tokens, **alloc_kwargs)
-            return None
+                    return (mgr.allocate_slots(
+                        request, num_new_tokens, **alloc_kwargs), None)
+            return None, None
 
         # --- V3.1 Prefix protection path ---
 
@@ -488,7 +491,7 @@ class Scheduler(SchedulerInterface):
         if attempt.blocks is not None:
             self._pp_uncached_ok_count = getattr(
                 self, '_pp_uncached_ok_count', 0) + 1
-            return attempt.blocks  # USE_UNCACHED: all from uncached
+            return attempt.blocks, 'use_uncached'
 
         plan = attempt.plan
         protection_gap = plan.protection_gap
@@ -547,13 +550,20 @@ class Scheduler(SchedulerInterface):
             can_fully_protect=can_fully_protect,
             caller=caller,
             hit_rate=hit_rate,
-            recency_age=recency_age)
+            recency_age=recency_age,
+            protection_gap=protection_gap)
 
-        # Compute costs for trace/logging
-        ce_val = pp_cfg.compute_ce(h_eff, groups_est, n_decode, n_prefill)
-        cc_val = pp_cfg.compute_cc(touched, hit_rate=hit_rate,
-                                   recency_age=recency_age)
-        cp_val = pp_cfg.compute_cp_running(preempt_tokens)
+        # Compute costs for trace/logging (match decide() effective values)
+        ce_val = (pp_cfg.compute_ce(h_eff, groups_est, n_decode, n_prefill)
+                  if can_fully_protect else float('inf'))
+        cc_val = (pp_cfg.compute_cc(touched, hit_rate=hit_rate,
+                                    recency_age=recency_age)
+                  if touched > 0 else float('inf'))
+        cp_single = pp_cfg.compute_cp_running(preempt_tokens)
+        if cp_single <= 0:
+            cp_single = float('inf')
+        cp_val = cp_single * max(1, protection_gap if protection_gap > 0
+                                 else touched)
 
         logger.debug(
             "pp_decide: decision=%s, caller=%s, required=%d, uncached=%d, "
@@ -586,8 +596,9 @@ class Scheduler(SchedulerInterface):
                 (ce_val, cc_val, cp_val))
 
         # Step 4: execute decision
+        dec_str = decision.value
         if decision == ProtectionDecision.PREEMPT:
-            return None
+            return None, dec_str
 
         if decision == ProtectionDecision.PROTECT_AND_EXPAND:
             added = self._try_elastic_kv_expand(protection_gap)
@@ -597,13 +608,14 @@ class Scheduler(SchedulerInterface):
                     request, num_new_tokens,
                     alloc_mode="uncached_only", **alloc_kwargs)
                 if new_blocks is not None:
-                    return new_blocks
+                    return new_blocks, dec_str
             # Expand insufficient (worker under-delivered) →
             # fallback to RECLAIM_CACHED.
             logger.warning(
                 "pp: expand partial (%d/%d), fallback to reclaim_cached",
                 added, protection_gap)
             decision = ProtectionDecision.RECLAIM_CACHED
+            dec_str = decision.value
 
         if decision == ProtectionDecision.RECLAIM_CACHED:
             # Uncached first, then cached for remainder
@@ -611,18 +623,19 @@ class Scheduler(SchedulerInterface):
                 request, num_new_tokens,
                 alloc_mode="uncached_then_cached", **alloc_kwargs)
             if attempt.blocks is not None:
-                return attempt.blocks
+                return attempt.blocks, dec_str
             # Still failed → try expand for allocation gap
             if attempt.plan.allocation_gap > 0:
                 added = self._try_elastic_kv_expand(
                     attempt.plan.allocation_gap)
                 if added > 0:
-                    return mgr.allocate_slots(
+                    return (mgr.allocate_slots(
                         request, num_new_tokens,
-                        alloc_mode="uncached_then_cached", **alloc_kwargs)
-            return None
+                        alloc_mode="uncached_then_cached", **alloc_kwargs),
+                        dec_str)
+            return None, dec_str
 
-        return None
+        return None, dec_str
 
     def _trace_decision(self, **kwargs) -> None:
         """Write JSONL trace line if VLLM_ELASTIC_KV_TRACE is set."""
@@ -931,7 +944,7 @@ class Scheduler(SchedulerInterface):
                     # Prefix protection: uses exact deficit from coordinator,
                     # strict uncached allocation, and Ce/Cp cost model.
                     from vllm.v1.core.prefix_protect import CallerKind
-                    new_blocks = self._prefix_protection_try_allocate(
+                    new_blocks, _pp_dec = self._prefix_protection_try_allocate(
                         request,
                         num_new_tokens,
                         caller=CallerKind.RUNNING,
@@ -1215,17 +1228,62 @@ class Scheduler(SchedulerInterface):
                 # Prefix protection: uses exact deficit from coordinator,
                 # strict uncached allocation, and Ce/Cp cost model.
                 from vllm.v1.core.prefix_protect import CallerKind
-                new_blocks = self._prefix_protection_try_allocate(
-                    request,
-                    num_new_tokens,
-                    caller=CallerKind.WAITING,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                )
+                new_blocks, pp_decision = \
+                    self._prefix_protection_try_allocate(
+                        request,
+                        num_new_tokens,
+                        caller=CallerKind.WAITING,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
+
+                if (new_blocks is None
+                        and pp_decision == 'preempt'
+                        and len(self.running) > 0):
+                    # WAITING preempt executor: preempt one running victim
+                    # and retry once.  Mirrors RUNNING path cleanup.
+                    if self.policy == SchedulingPolicy.PRIORITY:
+                        victim = max(
+                            self.running,
+                            key=lambda r: (r.priority, r.arrival_time),
+                        )
+                        self.running.remove(victim)
+                    else:
+                        victim = self.running.pop()
+                    # Clean up current-step scheduled state for victim
+                    if victim in scheduled_running_reqs:
+                        scheduled_running_reqs.remove(victim)
+                        token_budget += num_scheduled_tokens.get(
+                            victim.request_id, 0)
+                        req_to_new_blocks.pop(victim.request_id, None)
+                        num_scheduled_tokens.pop(victim.request_id, None)
+                        scheduled_spec_decode_tokens.pop(
+                            victim.request_id, None)
+                        victim_encoder = scheduled_encoder_inputs.pop(
+                            victim.request_id, None)
+                        if victim_encoder:
+                            encoder_compute_budget += sum(
+                                victim.get_num_encoder_embeds(i)
+                                for i in victim_encoder)
+                    self._preempt_request(victim, scheduled_timestamp)
+                    preempted_reqs.append(victim)
+                    # Retry allocation once after preempt
+                    new_blocks, pp_decision = \
+                        self._prefix_protection_try_allocate(
+                            request,
+                            num_new_tokens,
+                            caller=CallerKind.WAITING,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
+                            num_lookahead_tokens=effective_lookahead_tokens,
+                            num_external_computed_tokens=num_external_computed_tokens,
+                            delay_cache_blocks=load_kv_async,
+                            num_encoder_tokens=num_encoder_tokens,
+                        )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.

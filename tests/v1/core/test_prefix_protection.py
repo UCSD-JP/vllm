@@ -162,16 +162,18 @@ class TestPrefixProtectionConfig:
         assert d == ProtectionDecision.RECLAIM_CACHED
 
     def test_decide_preempt(self):
-        """Cp is cheapest → PREEMPT (V3.1: partial tail model)."""
+        """Cp_total cheapest → PREEMPT (gap-normalized, small gap)."""
         from vllm.v1.core.prefix_protect import ProtectionDecision
         cfg = self._default_cfg()
-        # 1 token: partial=1%16=1 → finite Cp = 500+1000+1*15 = 1515
-        # high Ce (many groups, high h_eff), high Cc (100 touched)
+        # gap=1, Cp_single=1515, Cp_total=1515
+        # Ce: h=50, groups=20 → 24609 µs; Cc: 1 block → 1740 µs
+        # Cp=1515 < Cc=1740 < Ce=24609 → PREEMPT
         d = cfg.decide(h_eff=50, groups_to_evict=20,
-                       touched_cached_blocks=100,
+                       touched_cached_blocks=1,
                        preempt_computed_tokens=1,
                        n_decode=20, n_prefill=5,
-                       can_fully_protect=True)
+                       can_fully_protect=True,
+                       protection_gap=1)
         assert d == ProtectionDecision.PREEMPT
 
     def test_decide_partial_expand_blocked(self):
@@ -201,18 +203,20 @@ class TestPrefixProtectionConfig:
     # --- V3.1 CallerKind + DEFER tests ---
 
     def test_decide_running_preempt(self):
-        """RUNNING + valid partial-tail victim → PREEMPT."""
+        """RUNNING + small gap + valid victim → PREEMPT."""
         from vllm.v1.core.prefix_protect import (
             CallerKind, ProtectionDecision)
         cfg = self._default_cfg()
-        # preempt_computed_tokens=49 (partial=1) → low Cp
-        # high Ce (can_fully_protect=False → inf), high Cc (many touched)
+        # gap=1, Cp_single=1515, Cp_total=1515
+        # Ce=inf (can_fully_protect=False), Cc = 1*16*15+1500 = 1740
+        # Cp=1515 < Cc=1740 → PREEMPT
         d = cfg.decide(h_eff=50, groups_to_evict=20,
-                       touched_cached_blocks=100,
+                       touched_cached_blocks=1,
                        preempt_computed_tokens=49,
                        n_decode=20, n_prefill=5,
                        can_fully_protect=False,
-                       caller=CallerKind.RUNNING)
+                       caller=CallerKind.RUNNING,
+                       protection_gap=1)
         assert d == ProtectionDecision.PREEMPT
 
     def test_decide_running_no_yield_victim(self):
@@ -317,20 +321,50 @@ class TestPrefixProtectionConfig:
                         f"got {d} for touched={touched}, "
                         f"protect={protect}, pt={pt}")
 
-    def test_decide_waiting_never_preempts(self):
-        """WAITING never returns PREEMPT — always Ce vs Cc for progress."""
+    def test_decide_cp_gap_normalization(self):
+        """Cp is scaled by protection_gap (gap-normalized).
+
+        Single preempt Cp=1515 (49 tokens, partial=1).
+        With protection_gap=100: Cp_total=151500 >> Ce for small h_eff.
+        Cost model naturally prefers expand over preempt.
+        """
         from vllm.v1.core.prefix_protect import (
             CallerKind, ProtectionDecision)
         cfg = self._default_cfg()
-        # Even when Cp is cheapest, WAITING picks min(Ce, Cc)
-        # Ce=inf (can_fully_protect=False) → RECLAIM_CACHED
-        d = cfg.decide(h_eff=50, groups_to_evict=20,
+        # Cp_single=1515, gap=100 → Cp_total=151500
+        # Ce for h_eff=1, groups=1: ~12.3 µs → PROTECT_AND_EXPAND
+        d = cfg.decide(h_eff=1, groups_to_evict=1,
                        touched_cached_blocks=100,
+                       preempt_computed_tokens=49,
+                       n_decode=2, n_prefill=0,
+                       can_fully_protect=True,
+                       caller=CallerKind.WAITING,
+                       protection_gap=100)
+        assert d == ProtectionDecision.PROTECT_AND_EXPAND
+        # Same for RUNNING caller — cost model is caller-agnostic
+        d2 = cfg.decide(h_eff=1, groups_to_evict=1,
+                        touched_cached_blocks=100,
+                        preempt_computed_tokens=49,
+                        n_decode=2, n_prefill=0,
+                        can_fully_protect=True,
+                        caller=CallerKind.RUNNING,
+                        protection_gap=100)
+        assert d2 == ProtectionDecision.PROTECT_AND_EXPAND
+
+    def test_decide_cp_small_gap_preempt_viable(self):
+        """Small gap (1 block): Cp_total = Cp_single × 1, preempt viable."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        # Cp_single=1515, gap=1 → Cp_total=1515
+        # Ce=inf (can_fully_protect=False), Cc=1740 (1 block)
+        # Cp=1515 < Cc=1740 → PREEMPT
+        d = cfg.decide(h_eff=50, groups_to_evict=20,
+                       touched_cached_blocks=1,
                        preempt_computed_tokens=49,
                        n_decode=20, n_prefill=5,
                        can_fully_protect=False,
-                       caller=CallerKind.WAITING)
-        assert d == ProtectionDecision.RECLAIM_CACHED
+                       protection_gap=1)
+        assert d == ProtectionDecision.PREEMPT
 
     def test_decide_waiting_reclaim_when_no_running(self):
         """WAITING + Cp cheapest but running=0 → RECLAIM (fallback)."""
@@ -373,6 +407,38 @@ class TestPrefixProtectionConfig:
         # Ordering: fresh > half > cold
         assert cc_fresh > cc_half > cc_cold
 
+    # --- Cc gamma threshold tests ---
+
+    def test_compute_cc_gamma_no_effect_default(self):
+        """gamma=1.0, threshold=0.0 → identical to baseline (no suppression)."""
+        cfg = self._default_cfg(p_reuse_alpha=0.5,
+                                cc_gamma=1.0, cc_hit_threshold=0.0)
+        cfg_base = self._default_cfg(p_reuse_alpha=0.5)
+        for hr in [0.1, 0.3, 0.5, 0.78]:
+            cc_g = cfg.compute_cc(5, hit_rate=hr)
+            cc_b = cfg_base.compute_cc(5, hit_rate=hr)
+            assert cc_g == pytest.approx(cc_b), f"mismatch at hit_rate={hr}"
+
+    def test_compute_cc_gamma_threshold_suppression(self):
+        """gamma=2, threshold=0.4, hit=0.2 → suppressed Cc."""
+        cfg = self._default_cfg(p_reuse_alpha=0.5,
+                                cc_gamma=2.0, cc_hit_threshold=0.4)
+        raw_cost = 5 * 16 * 15.0 + 500 + 1000  # 2700
+        # p_base = 0.5 * 0.2 = 0.1
+        # suppression = (0.2 / 0.4) ^ (2-1) = 0.5
+        # p_eff = 0.1 * 0.5 = 0.05
+        cc = cfg.compute_cc(5, hit_rate=0.2)
+        assert cc == pytest.approx(0.05 * raw_cost)
+
+    def test_compute_cc_gamma_above_threshold_unchanged(self):
+        """gamma=2, threshold=0.4, hit=0.78 → no suppression (above threshold)."""
+        cfg = self._default_cfg(p_reuse_alpha=0.5,
+                                cc_gamma=2.0, cc_hit_threshold=0.4)
+        cfg_base = self._default_cfg(p_reuse_alpha=0.5)
+        cc_g = cfg.compute_cc(5, hit_rate=0.78)
+        cc_b = cfg_base.compute_cc(5, hit_rate=0.78)
+        assert cc_g == pytest.approx(cc_b)
+
     # --- from_env tests ---
 
     def test_from_env_defaults(self):
@@ -381,12 +447,30 @@ class TestPrefixProtectionConfig:
         assert cfg.enable is False
         assert cfg.top_k == 10
         assert cfg.block_size == 16
+        assert cfg.h_cap == 64
+        assert cfg.cc_age_scale == 2000.0
+        assert cfg.cc_gamma == 1.0
+        assert cfg.cc_hit_threshold == 0.0
 
     def test_from_env_enable(self):
         """VLLM_PREFIX_PROTECTION_ENABLE=1 should enable."""
         with patch.dict("os.environ", {"VLLM_PREFIX_PROTECTION_ENABLE": "1"}):
             cfg = PrefixProtectionConfig.from_env()
             assert cfg.enable is True
+
+    def test_from_env_v41_knobs(self):
+        """V4.1 env knobs: h_cap, cc_age_scale, cc_gamma, cc_hit_threshold."""
+        with patch.dict("os.environ", {
+            "VLLM_PP_H_CAP": "32",
+            "VLLM_PP_CC_AGE_SCALE": "3000",
+            "VLLM_PP_CC_GAMMA": "2.0",
+            "VLLM_PP_CC_HIT_THRESHOLD": "0.4",
+        }):
+            cfg = PrefixProtectionConfig.from_env()
+            assert cfg.h_cap == 32
+            assert cfg.cc_age_scale == 3000.0
+            assert cfg.cc_gamma == 2.0
+            assert cfg.cc_hit_threshold == 0.4
 
 
 # =====================================================================
@@ -915,10 +999,11 @@ class TestPrefixProtectionSchedulerFlow:
         mgr.allocate_slots = MagicMock(return_value=success_blocks)
 
         request = MagicMock()
-        result = sched._prefix_protection_try_allocate(
+        result, dec = sched._prefix_protection_try_allocate(
             request, num_new_tokens=10)
 
         assert result is success_blocks
+        assert dec == 'protect_and_expand'
         sched._try_elastic_kv_expand.assert_called_once_with(protection_gap)
         mgr.allocate_slots.assert_called_once_with(
             request, 10, alloc_mode="uncached_only")
@@ -947,10 +1032,11 @@ class TestPrefixProtectionSchedulerFlow:
             side_effect=[fail_attempt, success_attempt])
 
         request = MagicMock()
-        result = sched._prefix_protection_try_allocate(
+        result, dec = sched._prefix_protection_try_allocate(
             request, num_new_tokens=10)
 
         assert result is success_attempt.blocks
+        assert dec == 'reclaim_cached'
         # Expand should NOT be called for reclaim path
         sched._try_elastic_kv_expand.assert_not_called()
         # Second try_allocate used uncached_then_cached
@@ -975,10 +1061,11 @@ class TestPrefixProtectionSchedulerFlow:
         mgr.try_allocate = MagicMock(return_value=fail_attempt)
 
         request = MagicMock()
-        result = sched._prefix_protection_try_allocate(
+        result, dec = sched._prefix_protection_try_allocate(
             request, num_new_tokens=10, caller=CallerKind.RUNNING)
 
         assert result is None
+        assert dec == 'preempt'
         sched._try_elastic_kv_expand.assert_not_called()
 
     def test_waiting_reclaim_returns_blocks(self):
@@ -1008,9 +1095,10 @@ class TestPrefixProtectionSchedulerFlow:
 
         request = MagicMock()
         request.request_id = "req-waiting-reclaim"
-        result = sched._prefix_protection_try_allocate(
+        result, dec = sched._prefix_protection_try_allocate(
             request, num_new_tokens=10, caller=CallerKind.WAITING)
         assert result is reclaim_blocks
+        assert dec == 'reclaim_cached'
 
     def test_defer_decision_removed_from_enum(self):
         """ProtectionDecision.DEFER no longer exists."""
@@ -1045,10 +1133,11 @@ class TestPrefixProtectionSchedulerFlow:
             side_effect=[fail_attempt, success_attempt])
 
         request = MagicMock()
-        result = sched._prefix_protection_try_allocate(
+        result, dec = sched._prefix_protection_try_allocate(
             request, num_new_tokens=10)
 
         assert result is success_attempt.blocks
+        assert dec == 'reclaim_cached'
         # Expand was tried but insufficient
         sched._try_elastic_kv_expand.assert_called_once()
         # Fallback to uncached_then_cached
