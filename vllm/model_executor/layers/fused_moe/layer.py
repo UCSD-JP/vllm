@@ -649,6 +649,8 @@ class FusedMoE(CustomOp):
         self._routing_snapshot: torch.Tensor | None = None  # topk_ids capture
         self._routing_len: torch.Tensor | None = None  # valid routing length
         self._snapshot_active: bool = False  # set by model_runner per step
+        self._use_eager_routing_prefill: bool = False  # set by gpu_worker
+        self._use_eager_routing_decode: bool = False   # set by gpu_worker
 
     # Note: maybe_init_modular_kernel should only be called by
     # prepare_communication_buffer_for_model.
@@ -692,6 +694,25 @@ class FusedMoE(CustomOp):
             dtype=torch.int32, device=device)
         self._routing_len = torch.zeros(
             1, dtype=torch.int32, device=device)
+
+    def _capture_routing_snapshot(
+        self, router_logits: torch.Tensor
+    ) -> None:
+        """Write routing top-k into persistent snapshot buffer.
+
+        Called from moe_forward / moe_forward_shared custom ops so it
+        executes on the actual forward path (piecewise CUDA graphs bypass
+        forward_cuda).  All ops are GPU-only — safe inside CUDA graph.
+        """
+        if (self._snapshot_active
+                and self._routing_snapshot is not None):
+            topk = min(self.top_k, router_logits.shape[1])
+            _, topk_ids = torch.topk(
+                router_logits, topk, dim=-1, sorted=False)
+            flat = topk_ids.flatten()
+            snap_len = min(flat.shape[0], self._routing_snapshot.shape[0])
+            self._routing_snapshot[:snap_len].copy_(flat[:snap_len])
+            self._routing_len.fill_(snap_len)
 
     @property
     def shared_experts(self) -> torch.nn.Module | None:
@@ -1640,6 +1661,8 @@ class FusedMoE(CustomOp):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
+        if self._cache_map is not None:
+            return self._cache_map
         return (
             self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
         )
@@ -1649,30 +1672,9 @@ class FusedMoE(CustomOp):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        result = self.forward_native(hidden_states, router_logits)
-
-        # Elastic KV: capture routing snapshot for next-step prediction.
-        # This runs inside CUDA graph — uses persistent buffers.
-        # _snapshot_active is set per-step by model_runner; False when
-        # dormant (no evicted experts) to avoid redundant torch.topk.
-        if (self._snapshot_active
-                and self._routing_snapshot is not None):
-            # router_logits shape: [num_tokens, num_experts]
-            # topk_ids would be computed from router_logits
-            # We capture the raw router_logits for prediction.
-            # The actual topk_ids are computed in the routing layer,
-            # but for snapshot we just need the selected expert indices.
-            # For now, capture top-k from router_logits directly.
-            num_tokens = router_logits.shape[0]
-            topk = min(self.top_k, router_logits.shape[1])
-            _, topk_ids = torch.topk(
-                router_logits, topk, dim=-1, sorted=False)
-            flat = topk_ids.flatten()
-            snap_len = min(flat.shape[0], self._routing_snapshot.shape[0])
-            self._routing_snapshot[:snap_len].copy_(flat[:snap_len])
-            self._routing_len.fill_(snap_len)
-
-        return result
+        # Routing snapshot capture moved to moe_forward / moe_forward_shared
+        # custom ops — forward_cuda is bypassed by piecewise CUDA graphs.
+        return self.forward_native(hidden_states, router_logits)
 
     def forward_impl_chunked(
         self,
@@ -1936,9 +1938,48 @@ class FusedMoE(CustomOp):
                 if self.capture is not None:
                     self.capture(topk_ids)
 
+                # Eager routing boundary: graph split for fresh routing
+                # sync fetch before expert execution.
+                #
+                # Policy summary (see EAGER_ROUTING_SPEC.md):
+                #   prefill + prefill_flag + chunk>0 + Tensor x
+                #     → chunked: boundary+apply per token chunk
+                #   prefill + prefill_flag + (chunk=0 or tuple x)
+                #     → whole-call: boundary once, apply once
+                #   decode + decode_flag (e.g. L0 only)
+                #     → whole-call: boundary once, apply once
+                #   decode + !decode_flag (non-L0)
+                #     → no boundary, no split, predictive only
+                #
+                # Phase gate is at callsite (not inside op) to avoid
+                # unnecessary CUDA graph splits.
+                _ec = getattr(self, '_expert_cache', None)
+                _prefillish = (
+                    _ec is not None
+                    and getattr(_ec, '_prefillish_step', False))
+                # Dormant guard: if offload is dormant (all experts
+                # resident, no eviction), skip eager boundary entirely.
+                _offload_active = (
+                    _ec is not None
+                    and not getattr(_ec, '_dormant', True))
+                _static_topo = (
+                    _ec is not None
+                    and (getattr(_ec, '_static_topo_active', False)
+                         or getattr(_ec, '_cutoff_active', False)))
+                _use_eager = (
+                    _offload_active
+                    and not _static_topo
+                    and ((_prefillish and self._use_eager_routing_prefill)
+                         or (not _prefillish
+                             and self._use_eager_routing_decode)))
+
+                if _use_eager:
+                    topk_ids = torch.ops.vllm.eager_routing_boundary(
+                        topk_ids, self.layer_name)
+
                 final_hidden_states = self.quant_method.apply(
                     layer=self,
-                    x=x,  # The type signture of this is wrong due to the hack.
+                    x=x,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                 )
@@ -2068,7 +2109,9 @@ def moe_forward(
 ) -> torch.Tensor:
     self = get_layer_from_name(layer_name)
     assert self.shared_experts is None
-    return self.forward_impl(hidden_states, router_logits)
+    result = self.forward_impl(hidden_states, router_logits)
+    self._capture_routing_snapshot(router_logits)
+    return result
 
 
 def moe_forward_fake(
@@ -2095,7 +2138,9 @@ def moe_forward_shared(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     self = get_layer_from_name(layer_name)
     assert self.shared_experts is not None
-    return self.forward_impl(hidden_states, router_logits)
+    result = self.forward_impl(hidden_states, router_logits)
+    self._capture_routing_snapshot(router_logits)
+    return result
 
 
 def moe_forward_shared_fake(
@@ -2115,6 +2160,94 @@ direct_register_custom_op(
     fake_impl=moe_forward_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
+
+
+# ── Eager Routing Boundary ───────────────────────────────────
+# Custom op that acts as a CUDA graph splitting point.
+# When inserted between router.select_experts() and quant_method.apply(),
+# it creates a graph boundary where fresh routing can be read and
+# experts loaded synchronously (eliminating 1-step-behind prediction miss).
+#
+# Activated per-layer via _use_eager_routing_prefill / _use_eager_routing_decode
+# Controlled by env vars:
+#   VLLM_EXPERT_EAGER_ROUTING_PREFILL (e.g., "all")
+#   VLLM_EXPERT_EAGER_ROUTING_DECODE  (e.g., "0" or "0,47")
+
+
+def eager_routing_boundary(topk_ids: torch.Tensor,
+                           layer_name: str) -> torch.Tensor:
+    """Graph boundary: read fresh routing → update cache → return topk_ids."""
+    self = get_layer_from_name(layer_name)
+    if (hasattr(self, '_expert_cache') and self._expert_cache is not None
+            and hasattr(self._expert_cache, 'eager_pre_step_single_layer')):
+        self._expert_cache.eager_pre_step_single_layer(
+            self._expert_cache_layer_idx, topk_ids, self)
+    return topk_ids
+
+
+def eager_routing_boundary_fake(topk_ids: torch.Tensor,
+                                layer_name: str) -> torch.Tensor:
+    return topk_ids
+
+
+direct_register_custom_op(
+    op_name="eager_routing_boundary",
+    op_func=eager_routing_boundary,
+    mutates_args=[],
+    fake_impl=eager_routing_boundary_fake,
+)
+
+
+# ── 3-D: Expert Group Boundary ────────────────────────────────
+# Custom op: CUDA graph split between MoE layer groups during decode.
+# Previous group's fresh routing → predict → async-prefetch next group.
+# Activated via VLLM_EXPERT_GROUP_SIZE env var. Decode-only.
+
+
+def expert_group_boundary(hidden_states: torch.Tensor,
+                          group_idx: int) -> torch.Tensor:
+    """Graph boundary between MoE layer groups.
+
+    Called unconditionally from model loop (static gate) so it is always
+    included in CUDA graph traces.  Runtime checks are here:
+      - capturing → no-op (graph warmup, no side effects)
+      - _has_decode_tokens → skip if pure prefill
+      - _dormant / _snapshot_active → checked inside inter_group_step
+    """
+    # During CUDA graph capture, just passthrough — no CPU side effects.
+    if torch.cuda.is_current_stream_capturing():
+        return hidden_states
+
+    ctx = get_forward_context()
+    all_moe_layers = getattr(ctx, 'all_moe_layers', None)
+    if all_moe_layers is None:
+        return hidden_states
+    first_layer = ctx.no_compile_layers.get(all_moe_layers[0])
+    if first_layer is None:
+        return hidden_states
+    cache = getattr(first_layer, '_expert_cache', None)
+    if cache is None or not hasattr(cache, 'inter_group_step'):
+        return hidden_states
+    # Skip pure prefill: 3-D benefits decode tokens only
+    if not getattr(cache, '_has_decode_tokens', False):
+        return hidden_states
+    layers = [ctx.no_compile_layers.get(name) for name in all_moe_layers]
+    cache.inter_group_step(group_idx, layers)
+    return hidden_states
+
+
+def expert_group_boundary_fake(hidden_states: torch.Tensor,
+                               group_idx: int) -> torch.Tensor:
+    return hidden_states
+
+
+direct_register_custom_op(
+    op_name="expert_group_boundary",
+    op_func=expert_group_boundary,
+    mutates_args=[],
+    fake_impl=expert_group_boundary_fake,
+)
+
 
 # Mark the FusedMoE weight_loader as supporting MoE-specific parameters
 # to avoid expensive runtime reflection in model loading code

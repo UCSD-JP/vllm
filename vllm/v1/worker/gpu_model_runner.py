@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -647,6 +648,8 @@ class GPUModelRunner(
         self._elastic_kv_enabled: bool = False
         self._vmm_pool = None  # VMMPagePool, set by gpu_worker
         self._expert_cache = None  # ExpertCacheManager, set by gpu_worker
+        self._expert_miss_log = os.environ.get(
+            "VLLM_EXPERT_MISS_LOG", "0") == "1"
         self._per_tensor_block_bytes: dict[int, int] = {}  # set by gpu_worker
 
         self.mm_budget = (
@@ -3315,13 +3318,59 @@ class GPUModelRunner(
 
         # --- Elastic KV: pre_step (expert cache update, before CUDA graph) ---
         if self._expert_cache is not None:
+            # Phase flag: prefillish = any request has >1 scheduled token.
+            # This is a PROXY, not exact max_query_len. Speculative decode
+            # or multi-token decode may be misclassified as prefillish.
+            # Acceptable for current use (prefill all / decode L0 only).
+            # See EAGER_ROUTING_SPEC.md section 1.
+            sched_vals = list(
+                scheduler_output.num_scheduled_tokens.values()
+            ) if scheduler_output.num_scheduled_tokens else [1]
+            max_sched = max(sched_vals)
+            min_sched = min(sched_vals)
+            self._expert_cache._prefillish_step = (max_sched > 1)
+            # 3-D group boundary: decode tokens present in this step?
+            # decode token = num_scheduled_tokens == 1 for that request.
+            self._expert_cache._has_decode_tokens = (min_sched == 1)
             moe_layers = self._get_moe_layers()
-            self._expert_cache.pre_step(moe_layers)
+            stats = self._expert_cache.pre_step(moe_layers)
+            # Per-layer miss rate logging (VLLM_EXPERT_MISS_LOG=1 to enable)
+            if self._expert_miss_log:
+                step = self._expert_cache.current_step
+                layer_stats = stats.get('layer_stats', [])
+                if stats.get('total_routed', 0) > 0:
+                    if step % 100 == 0 or stats['miss_ratio'] > 0.05:
+                        details = " ".join(
+                            f"L{i}:{ls['misses']}/{ls['routed']}"
+                            for i, ls in enumerate(layer_stats)
+                            if ls.get('routed', 0) > 0)
+                        logger.info(
+                            "[Expert] step=%d miss=%.4f [%s]",
+                            step, stats['miss_ratio'], details)
+                # Per-layer routing frequency top-10 (every 500 steps)
+                if step % 500 == 0:
+                    for i, ls in enumerate(layer_stats):
+                        freq = ls.get('expert_freq')
+                        if freq is not None and freq.sum() > 0:
+                            topk_vals, topk_idx = freq.topk(
+                                min(10, freq.shape[0]))
+                            logger.info(
+                                "[Expert] step=%d L%d top10: %s",
+                                step, i,
+                                " ".join(
+                                    f"E{e}:{c}"
+                                    for e, c in zip(
+                                        topk_idx.tolist(),
+                                        topk_vals.tolist())
+                                    if c > 0))
             if self._vmm_pool is not None:
                 self._vmm_pool.mark_step_start()
             # Set routing snapshot state: only capture when experts
             # are actually evicted (dormant → no snapshot overhead).
             snap = self._expert_cache.has_evicted_experts()
+            if not getattr(self._expert_cache,
+                           '_static_topo_active', False):
+                self._expert_cache._dormant = not snap
             for layer in moe_layers:
                 layer._snapshot_active = snap
 
@@ -3612,6 +3661,7 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+
         return None
 
     @torch.inference_mode

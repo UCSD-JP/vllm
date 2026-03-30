@@ -999,6 +999,14 @@ class Qwen3NextModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # 3-D: Group boundary config
+        import os
+        self._expert_group_size = int(
+            os.environ.get("VLLM_EXPERT_GROUP_SIZE", "0"))
+        self._total_moe_layers = sum(
+            1 for layer in self.layers
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'))
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1020,12 +1028,25 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        _moe_count = 0
+        _group_size = self._expert_group_size
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            # 3-D: Group boundary after every G-th MoE layer.
+            # STATIC gate only — must be unconditional so the op is always
+            # included in CUDA graph traces. Runtime checks (_has_decode_tokens,
+            # _dormant, _snapshot_active) are inside the op implementation
+            # (layer.py expert_group_boundary → inter_group_step).
+            if _group_size > 0 and hasattr(layer.mlp, 'experts'):
+                _moe_count += 1
+                if (_moe_count % _group_size == 0
+                        and _moe_count < self._total_moe_layers):
+                    hidden_states = torch.ops.vllm.expert_group_boundary(
+                        hidden_states, _moe_count // _group_size)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

@@ -305,7 +305,8 @@ class TestPrefixProtectionConfig:
         valid = {ProtectionDecision.USE_UNCACHED,
                  ProtectionDecision.PROTECT_AND_EXPAND,
                  ProtectionDecision.RECLAIM_CACHED,
-                 ProtectionDecision.PREEMPT}
+                 ProtectionDecision.PREEMPT,
+                 ProtectionDecision.PARTIAL_EXPAND_AND_RECLAIM}
         cfg = self._default_cfg()
         # Sweep: touched, protect, preempt_tokens
         for touched in [0, 1, 50]:
@@ -365,6 +366,86 @@ class TestPrefixProtectionConfig:
                        can_fully_protect=False,
                        protection_gap=1)
         assert d == ProtectionDecision.PREEMPT
+
+    # --- Plan B (4-way) decide tests ---
+
+    def test_decide_partial_expand_cheaper(self):
+        """Plan B: floor expand + partial reclaim cheaper than full reclaim."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        # Verify Cb < Ce and Cb < Cc:
+        # gap=10 (from protection_gap=10), floor_blocks=8, remainder=2
+        # Ce(h=50, g=20) = 10*(40/512)*0.63*50*1000 = 24609.375
+        # Cc(50 blocks, static p=1) = 1*(50*16*15+1500) = 13500
+        # Ce_floor(h=50, g=4) = 10*(8/512)*0.63*50*1000 = 4921.875
+        # Cc_rem(min(2,50)=2 blocks) = 1*(2*16*15+1500) = 1980
+        # Cb = 4921.875 + 1980 = 6901.875
+        # Cb=6901 < Cc=13500 < Ce=24609 → PARTIAL_EXPAND_AND_RECLAIM
+        Ce = cfg.compute_ce(50, 20, 10, 2)
+        Cc = cfg.compute_cc(50)
+        Ce_floor = cfg.compute_ce(50, 4, 10, 2)
+        Cc_rem = cfg.compute_cc(2)
+        Cb = Ce_floor + Cc_rem
+        assert Cb < Cc, f"Cb={Cb} should be < Cc={Cc}"
+        assert Cb < Ce, f"Cb={Cb} should be < Ce={Ce}"
+        d = cfg.decide(h_eff=50, groups_to_evict=20,
+                       touched_cached_blocks=50,
+                       preempt_computed_tokens=10000,
+                       n_decode=10, n_prefill=2,
+                       can_fully_protect=True,
+                       protection_gap=10,
+                       floor_expand_groups=4,
+                       floor_expand_blocks=8)
+        assert d == ProtectionDecision.PARTIAL_EXPAND_AND_RECLAIM
+
+    def test_decide_plan_b_floor_zero_degenerates(self):
+        """floor=0 → Cb=inf → degenerates to 3-way (RECLAIM_CACHED)."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        # Same as reclaim test but with floor=0
+        d = cfg.decide(h_eff=50, groups_to_evict=20,
+                       touched_cached_blocks=1,
+                       preempt_computed_tokens=10000,
+                       n_decode=20, n_prefill=5,
+                       can_fully_protect=True,
+                       protection_gap=10,
+                       floor_expand_groups=0,
+                       floor_expand_blocks=0)
+        assert d == ProtectionDecision.RECLAIM_CACHED
+
+    def test_decide_plan_b_no_remainder(self):
+        """floor_blocks >= gap → remainder=0 → Cb=inf → PROTECT_AND_EXPAND."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        # floor_blocks=10 >= gap=10 → no remainder → Cb=inf
+        # Ce cheap (h=1, g=1) → PROTECT_AND_EXPAND
+        d = cfg.decide(h_eff=1, groups_to_evict=1,
+                       touched_cached_blocks=100,
+                       preempt_computed_tokens=10000,
+                       n_decode=2, n_prefill=0,
+                       can_fully_protect=True,
+                       protection_gap=10,
+                       floor_expand_groups=4,
+                       floor_expand_blocks=10)
+        assert d == ProtectionDecision.PROTECT_AND_EXPAND
+
+    def test_decide_plan_b_no_cached(self):
+        """touched=0 → Cb=inf → Plan B impossible."""
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+        cfg = self._default_cfg()
+        d = cfg.decide(h_eff=50, groups_to_evict=8,
+                       touched_cached_blocks=0,
+                       preempt_computed_tokens=10000,
+                       n_decode=10, n_prefill=2,
+                       can_fully_protect=True,
+                       protection_gap=10,
+                       floor_expand_groups=4,
+                       floor_expand_blocks=5)
+        # touched=0 → USE_UNCACHED (protection_gap > 0 but touched=0)
+        # Wait — protection_gap=10 > 0, so it won't early return USE_UNCACHED.
+        # touched=0 → Cc=inf, Cb=inf (remainder > 0 but touched=0)
+        # Ce finite, Cp=inf (10000%16==0) → PROTECT_AND_EXPAND
+        assert d == ProtectionDecision.PROTECT_AND_EXPAND
 
     def test_decide_waiting_reclaim_when_no_running(self):
         """WAITING + Cp cheapest but running=0 → RECLAIM (fallback)."""
@@ -947,6 +1028,9 @@ class TestPrefixProtectionSchedulerFlow:
         sched._trace_decision = MagicMock()  # no-op trace
         sched._diag_last_pp_active = None
         sched.block_size = 16
+        sched._preempt_queue_ema_us = 0.0
+        sched._preempt_queue_ema_alpha = 0.3
+        sched._preempt_timestamps = {}
 
         # V3.1 prefix protection config with mocked decide()
         pp_cfg = MagicMock(spec=PrefixProtectionConfig)
@@ -970,6 +1054,7 @@ class TestPrefixProtectionSchedulerFlow:
         ekv_cfg.per_tensor_block_bytes = {0: 32768}
         ekv_cfg.page_size = 2097152
         ekv_cfg.max_expand_blocks = 1000
+        ekv_cfg.min_expand_unit = 4
         sched._elastic_kv_config = ekv_cfg
 
         # Expand
@@ -1142,3 +1227,65 @@ class TestPrefixProtectionSchedulerFlow:
         sched._try_elastic_kv_expand.assert_called_once()
         # Fallback to uncached_then_cached
         assert mgr.try_allocate.call_count == 2
+
+    def test_prefix_protection_plan_b_retry_flow(self):
+        """Plan B → expand floor → alloc fails → retry → RECLAIM → success.
+
+        Verifies receding-horizon retry: Plan B changes pool state,
+        retry re-evaluates and succeeds with a different decision.
+        """
+        from vllm.v1.core.kv_cache_manager import (
+            AllocationAttempt, AllocationPlan)
+        from vllm.v1.core.prefix_protect import ProtectionDecision
+
+        sched = self._make_scheduler_stub(
+            decision_value="partial_expand_and_reclaim",
+            expand_return=5)
+
+        fail_plan = AllocationPlan(
+            required_blocks=10, total_free=20,
+            noncached_free=5, cached_free=15)
+        fail_attempt = AllocationAttempt(blocks=None, plan=fail_plan)
+
+        success_blocks = MagicMock(name="success_blocks")
+        success_plan = AllocationPlan(
+            required_blocks=10, total_free=25,
+            noncached_free=10, cached_free=15)
+        success_attempt = AllocationAttempt(
+            blocks=success_blocks, plan=success_plan)
+
+        mgr = sched.kv_cache_manager
+        # Call sequence:
+        # 1st call (retry=0): uncached_only → fail
+        # 2nd call (retry=0): Plan B uncached_then_cached → fail
+        # 3rd call (retry=1): uncached_only → fail
+        # 4th call (retry=1): reclaim uncached_then_cached → success
+        mgr.try_allocate = MagicMock(
+            side_effect=[fail_attempt, fail_attempt, fail_attempt,
+                         success_attempt])
+
+        # On retry, decide() returns RECLAIM_CACHED
+        pp_cfg = sched._prefix_protection_config
+        pp_cfg.decide = MagicMock(side_effect=[
+            ProtectionDecision.PARTIAL_EXPAND_AND_RECLAIM,
+            ProtectionDecision.RECLAIM_CACHED,
+        ])
+
+        request = MagicMock()
+        result, dec = sched._prefix_protection_try_allocate(
+            request, num_new_tokens=10)
+
+        assert result is success_blocks
+        # Expand called once (Plan B floor expand)
+        sched._try_elastic_kv_expand.assert_called_once()
+        # try_allocate called at least 3 times (1st uncached + Plan B + retry)
+        assert mgr.try_allocate.call_count >= 3
+        # decide() called twice (original + retry)
+        assert pp_cfg.decide.call_count == 2
+        # PP decision stats recorded as 4-tuple
+        stats = getattr(sched, '_pp_decision_stats', {})
+        if stats:
+            for costs_list in stats.values():
+                for cost_tuple in costs_list:
+                    assert len(cost_tuple) == 4, \
+                        f"Expected 4-tuple (Ce,Cc,Cp,Cb), got {cost_tuple}"

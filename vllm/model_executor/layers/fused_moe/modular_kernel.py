@@ -37,6 +37,9 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+import os
+_EXPERT_DEBUG = os.environ.get("VLLM_EXPERT_DEBUG", "0") == "1"
+
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
 # The goal is to be able to utilize different communication mechanisms with
@@ -735,6 +738,9 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         workspace2: torch.Tensor,
         expert_tokens_meta: ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        scratch_w13: torch.Tensor | None = None,
+        scratch_w2: torch.Tensor | None = None,
+        scratch_threshold: int = 0,
     ) -> None:
         """
         This function computes the intermediate result of a Mixture of Experts
@@ -1005,6 +1011,16 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts: int,
         expert_map: torch.Tensor | None,
     ) -> ExpertTokensMetadata | None:
+        if _EXPERT_DEBUG and not getattr(FusedMoEModularKernel, '_metadata_sc_logged', False):
+            FusedMoEModularKernel._metadata_sc_logged = True
+            logger.info(
+                "expert_tokens_metadata: num_chunks=%d, "
+                "full_meta_is_none=%s, "
+                "count_expert_num_tokens %s",
+                num_chunks,
+                full_expert_tokens_meta is None,
+                "SKIPPED" if (num_chunks == 1 or full_expert_tokens_meta is None) else "CALLED",
+            )
         if num_chunks == 1 or full_expert_tokens_meta is None:
             return full_expert_tokens_meta
 
@@ -1131,6 +1147,9 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
+        scratch_w13: torch.Tensor | None = None,
+        scratch_w2: torch.Tensor | None = None,
+        scratch_threshold: int = 0,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1206,6 +1225,9 @@ class FusedMoEModularKernel(torch.nn.Module):
                 workspace2=workspace2,
                 expert_tokens_meta=c_expert_tokens_meta,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                scratch_w13=scratch_w13,
+                scratch_w2=scratch_w2,
+                scratch_threshold=scratch_threshold,
             )
 
         return fused_out
@@ -1289,6 +1311,9 @@ class FusedMoEModularKernel(torch.nn.Module):
         global_num_experts: int = -1,
         expert_map: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
+        scratch_w13: torch.Tensor | None = None,
+        scratch_w2: torch.Tensor | None = None,
+        scratch_threshold: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1350,6 +1375,9 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
+            scratch_w13=scratch_w13,
+            scratch_w2=scratch_w2,
+            scratch_threshold=scratch_threshold,
         )
 
         return self._finalize(

@@ -165,6 +165,11 @@ class Scheduler(SchedulerInterface):
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
 
+        # Preempt queue delay EMA (measured, feeds into Cp)
+        self._preempt_queue_ema_us: float = 0.0
+        self._preempt_queue_ema_alpha: float = 0.3
+        self._preempt_timestamps: dict[str, float] = {}  # req_id -> mono ts
+
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
@@ -425,6 +430,7 @@ class Scheduler(SchedulerInterface):
     def _prefix_protection_try_allocate(
         self, request, num_new_tokens,
         caller=None,
+        _retry: int = 0,
         **alloc_kwargs
     ):
         """V3.1 prefix protection + elastic expand + allocate.
@@ -435,8 +441,11 @@ class Scheduler(SchedulerInterface):
           3. Compute V3.1 costs (Ce, Cc, Cp) with caller-aware model.
           4. Execute decision:
              - PROTECT_AND_EXPAND → expand + UNCACHED_ONLY retry
+             - PARTIAL_EXPAND_AND_RECLAIM → floor expand + reclaim retry
              - RECLAIM_CACHED → UNCACHED_THEN_CACHED alloc
              - PREEMPT → return None (running: caller preempts)
+          5. On failure (after legacy expand attempts): receding-horizon
+             retry (1 attempt, fresh pool state → re-computed costs).
           WAITING path is work-conserving: no DEFER, always action or fail.
 
         Args:
@@ -502,6 +511,7 @@ class Scheduler(SchedulerInterface):
         n_prefill = sum(1 for r in self.running
                         if r.num_output_tokens == 0)
         n_decode = max(1, len(self.running) - n_prefill)
+        has_decode = (len(self.running) > n_prefill)  # raw boolean
 
         # Estimate groups to evict from runtime geometry
         cfg = getattr(self, '_elastic_kv_config', None)
@@ -516,6 +526,18 @@ class Scheduler(SchedulerInterface):
         else:
             groups_est = 1
 
+        # Quantum floor for Plan B (partial expand + reclaim)
+        quantum = getattr(cfg, 'min_expand_unit', 4)
+        floor_groups = (groups_est // quantum) * quantum
+        if floor_groups > 0 and floor_groups < groups_est:
+            from vllm.vmm_pool import max_blocks_for_pages
+            floor_blocks = max_blocks_for_pages(
+                floor_groups * cfg.group_pages, cfg.per_tensor_block_bytes,
+                cfg.page_size)
+        else:
+            floor_groups = 0
+            floor_blocks = 0
+
         # can_fully_protect: partial expand prevention.
         remaining_cap = (
             cfg.max_expand_blocks - self._elastic_kv_expanded_total
@@ -524,6 +546,11 @@ class Scheduler(SchedulerInterface):
         can_fully_protect = (
             hasattr(self, '_elastic_kv_handler')
             and remaining_cap >= protection_gap)
+
+        # Cap check: floor_blocks must also fit within remaining_cap
+        if floor_blocks > 0 and floor_blocks > remaining_cap:
+            floor_groups = 0
+            floor_blocks = 0
 
         # Preempt cost: compute for both callers (waiting can preempt too
         # if running > 0).  Returns 0 when running is empty.
@@ -542,6 +569,9 @@ class Scheduler(SchedulerInterface):
 
         # Step 3: Work-conserving decision with caller
         pp_cfg = self._prefix_protection_config
+        # Measured queue delay EMA overrides static t_queue_us in Cp
+        t_q_override = (self._preempt_queue_ema_us
+                        if self._preempt_queue_ema_us > 0 else None)
         decision = pp_cfg.decide(
             h_eff=h_eff, groups_to_evict=groups_est,
             touched_cached_blocks=touched,
@@ -551,29 +581,49 @@ class Scheduler(SchedulerInterface):
             caller=caller,
             hit_rate=hit_rate,
             recency_age=recency_age,
-            protection_gap=protection_gap)
+            protection_gap=protection_gap,
+            floor_expand_groups=floor_groups,
+            floor_expand_blocks=floor_blocks,
+            t_queue_override=t_q_override,
+            has_decode=has_decode)
 
         # Compute costs for trace/logging (match decide() effective values)
+        _can_expand = (can_fully_protect
+                       and not (pp_cfg.decode_freeze_expand and has_decode))
         ce_val = (pp_cfg.compute_ce(h_eff, groups_est, n_decode, n_prefill)
-                  if can_fully_protect else float('inf'))
+                  if _can_expand else float('inf'))
         cc_val = (pp_cfg.compute_cc(touched, hit_rate=hit_rate,
                                     recency_age=recency_age)
                   if touched > 0 else float('inf'))
-        cp_single = pp_cfg.compute_cp_running(preempt_tokens)
+        cp_single = pp_cfg.compute_cp_running(
+            preempt_tokens, t_queue_override=t_q_override)
         if cp_single <= 0:
             cp_single = float('inf')
         cp_val = cp_single * max(1, protection_gap if protection_gap > 0
                                  else touched)
 
+        # Cb: Plan B first-action cost estimate (MPC-style)
+        cb_val = float('inf')
+        gap = max(1, protection_gap if protection_gap > 0 else touched)
+        if floor_groups > 0 and floor_blocks > 0 and _can_expand:
+            remainder = max(0, gap - floor_blocks)
+            if remainder > 0 and touched > 0:
+                Ce_floor = pp_cfg.compute_ce(
+                    h_eff, floor_groups, n_decode, n_prefill)
+                Cc_rem = pp_cfg.compute_cc(
+                    min(remainder, touched),
+                    hit_rate=hit_rate, recency_age=recency_age)
+                cb_val = Ce_floor + Cc_rem
+
         logger.debug(
             "pp_decide: decision=%s, caller=%s, required=%d, uncached=%d, "
             "cached=%d, touched=%d, h_eff=%d, groups=%d, "
-            "Ce=%.0f Cc=%.0f Cp=%.0f, hit_rate=%.3f, "
+            "Ce=%.0f Cc=%.0f Cp=%.0f Cb~=%.0f, hit_rate=%.3f, "
             "can_protect=%s, remaining_cap=%.0f",
             decision.value, caller.value,
             plan.required_blocks, plan.noncached_free,
             plan.cached_free, touched, h_eff, groups_est,
-            ce_val, cc_val, cp_val, hit_rate,
+            ce_val, cc_val, cp_val, cb_val, hit_rate,
             can_fully_protect, remaining_cap,
         )
 
@@ -581,7 +631,7 @@ class Scheduler(SchedulerInterface):
         self._trace_decision(
             plan=plan, h_eff=h_eff, groups_est=groups_est,
             n_decode=n_decode, n_prefill=n_prefill,
-            ce=ce_val, cc=cc_val, cp=cp_val,
+            ce=ce_val, cc=cc_val, cp=cp_val, cb=cb_val,
             can_fully_protect=can_fully_protect,
             remaining_cap=remaining_cap,
             decision=decision, preempt_tokens=preempt_tokens,
@@ -593,7 +643,7 @@ class Scheduler(SchedulerInterface):
         if stats is not None:
             dec_key = decision.value
             stats.setdefault(dec_key, []).append(
-                (ce_val, cc_val, cp_val))
+                (ce_val, cc_val, cp_val, cb_val))
 
         # Step 4: execute decision
         dec_str = decision.value
@@ -617,6 +667,15 @@ class Scheduler(SchedulerInterface):
             decision = ProtectionDecision.RECLAIM_CACHED
             dec_str = decision.value
 
+        if decision == ProtectionDecision.PARTIAL_EXPAND_AND_RECLAIM:
+            added = self._try_elastic_kv_expand(floor_blocks)
+            attempt = mgr.try_allocate(
+                request, num_new_tokens,
+                alloc_mode="uncached_then_cached", **alloc_kwargs)
+            if attempt.blocks is not None:
+                return attempt.blocks, dec_str
+            # floor expand changed pool → fall through to tail retry
+
         if decision == ProtectionDecision.RECLAIM_CACHED:
             # Uncached first, then cached for remainder
             attempt = mgr.try_allocate(
@@ -633,8 +692,17 @@ class Scheduler(SchedulerInterface):
                         request, num_new_tokens,
                         alloc_mode="uncached_then_cached", **alloc_kwargs),
                         dec_str)
-            return None, dec_str
+            # Legacy expand + reclaim both failed → fall through to tail retry
 
+        # Receding-horizon: 1 retry with updated pool state
+        # Prior branches may have changed pool (expand, alloc attempts).
+        # Retry re-computes costs from fresh pool snapshot.
+        if _retry < 1:
+            logger.debug("pp: plan %s failed, retry with updated pool",
+                         dec_str)
+            return self._prefix_protection_try_allocate(
+                request, num_new_tokens, caller=caller,
+                _retry=_retry + 1, **alloc_kwargs)
         return None, dec_str
 
     def _trace_decision(self, **kwargs) -> None:
@@ -662,6 +730,7 @@ class Scheduler(SchedulerInterface):
         record['Ce'] = kwargs.get('ce', 0)
         record['Cc'] = kwargs.get('cc', 0)
         record['Cp'] = kwargs.get('cp', 0)
+        record['Cb'] = kwargs.get('cb', float('inf'))
         record['can_fully_protect'] = kwargs.get('can_fully_protect', False)
         record['remaining_cap'] = kwargs.get('remaining_cap', 0)
         decision = kwargs.get('decision')
@@ -809,8 +878,12 @@ class Scheduler(SchedulerInterface):
             ce_avg = sum(c[0] for c in costs) / n
             cc_avg = sum(c[1] for c in costs) / n
             cp_avg = sum(c[2] for c in costs) / n
+            cb_avg = sum(c[3] for c in costs) / n if len(costs[0]) > 3 else float('inf')
             parts.append(
-                f"{dec}={n}(Ce={ce_avg:.0f},Cc={cc_avg:.0f},Cp={cp_avg:.0f})")
+                f"{dec}={n}(Ce={ce_avg:.0f},Cc={cc_avg:.0f},"
+                f"Cp={cp_avg:.0f},Cb~={cb_avg:.0f})")
+        if self._preempt_queue_ema_us > 0:
+            parts.append(f"q_ema={self._preempt_queue_ema_us:.0f}µs")
         logger.info("[PP-DIAG] %s", " | ".join(parts))
 
         # Reset counters for next interval
@@ -1326,6 +1399,18 @@ class Scheduler(SchedulerInterface):
                     scheduled_new_reqs.append(request)
                 elif request.status == RequestStatus.PREEMPTED:
                     scheduled_resumed_reqs.append(request)
+                    # Measure preempt → re-schedule queue delay
+                    preempt_ts = self._preempt_timestamps.pop(
+                        request.request_id, 0.0)
+                    if preempt_ts > 0:
+                        delay_us = (time.monotonic() - preempt_ts) * 1e6
+                        alpha = self._preempt_queue_ema_alpha
+                        self._preempt_queue_ema_us = (
+                            alpha * delay_us
+                            + (1 - alpha) * self._preempt_queue_ema_us)
+                        logger.debug(
+                            "pp: preempt queue delay %.0fµs, EMA=%.0fµs",
+                            delay_us, self._preempt_queue_ema_us)
                 else:
                     raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -1473,6 +1558,8 @@ class Scheduler(SchedulerInterface):
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+        # Record preempt timestamp for queue delay EMA
+        self._preempt_timestamps[request.request_id] = time.monotonic()
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
@@ -2254,6 +2341,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        self._preempt_timestamps.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 

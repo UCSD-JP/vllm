@@ -57,6 +57,8 @@ from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_
 
 logger = init_logger(__name__)
 
+_EXPERT_DEBUG = os.environ.get("VLLM_EXPERT_DEBUG", "0") == "1"
+
 
 @triton.jit
 def write_zeros_to_output(
@@ -828,6 +830,212 @@ def invoke_fused_moe_triton_kernel(
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
         HAS_BIAS=HAS_BIAS,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        **config,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scratch-enabled kernel variant (unquantized bf16/fp16 only)
+# ═══════════════════════════════════════════════════════════════
+# Separate kernel to avoid polluting the original fused_moe_kernel
+# compilation cache and to isolate scratch pointer arithmetic.
+
+@triton.jit
+def fused_moe_kernel_with_scratch(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    # Scratch weight pointer
+    scratch_b_ptr,
+    scratch_threshold,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    # Strides for base weight tensor
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    # Scratch weight expert stride (may differ from stride_be)
+    scratch_stride_be,
+    naive_block_assignment: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    """
+    Scratch-enabled fused MoE kernel variant.
+    Unquantized (bf16/fp16) only. No bias, no scales.
+    Expert IDs >= scratch_threshold read from scratch_b_ptr.
+    Expert IDs < scratch_threshold read from b_ptr.
+    off_experts is a per-block scalar → pure scalar branch, zero divergence.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    if not naive_block_assignment:
+        offs_token_id = pid_m * BLOCK_SIZE_M + offs
+        offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    else:
+        offs_token = tl.where(
+            offs == 0,
+            pid_m,
+            num_valid_tokens,
+        )
+
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        write_zeros_to_output(
+            c_ptr, stride_cm, stride_cn, pid_n, N,
+            offs_token, token_mask,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, compute_type,
+        )
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N +
+               tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am +
+        offs_k[None, :] * stride_ak
+    )
+
+    # ── Scratch branch: scalar if/else, no warp divergence ──
+    # off_experts is a per-block scalar. This is the same pattern as the
+    # existing `if off_experts == -1:` branch above — proven to compile.
+    # Both branches produce a pointer tensor of the same type.
+    _kn_offsets = offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    if off_experts >= scratch_threshold:
+        _eff_exp = off_experts - scratch_threshold
+        b_ptrs = (scratch_b_ptr + _eff_exp * scratch_stride_be + _kn_offsets)
+    else:
+        b_ptrs = (b_ptr + off_experts * stride_be + _kn_offsets)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+            other=0.0)
+        accumulator = tl.dot(a, b, acc=accumulator)
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token,
+                             mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (c_ptr + stride_cm * offs_token[:, None] +
+              stride_cn * offs_cn[None, :])
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def invoke_fused_moe_scratch_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    scratch_B: torch.Tensor,
+    scratch_threshold: int,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+):
+    """
+    Invoke the scratch-enabled fused MoE kernel.
+    Unquantized only — no scales, no bias, no int8/fp8/int4.
+    """
+    assert topk_weights is not None or not mul_routed_weight
+    assert topk_weights is None or topk_weights.stride(1) == 1
+    assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+
+    M = A.size(0)
+    num_tokens = M * top_k
+    if sorted_token_ids is not None:
+        EM = sorted_token_ids.size(0)
+        if A.size(0) < config["BLOCK_SIZE_M"]:
+            EM = min(
+                sorted_token_ids.size(0),
+                A.size(0) * top_k * config["BLOCK_SIZE_M"])
+    else:
+        EM = num_tokens * config["BLOCK_SIZE_M"]
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+    )
+
+    config = config.copy()
+    config["SPLIT_K"] = 1
+    BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
+    fused_moe_kernel_with_scratch[grid](
+        A,
+        B,
+        C,
+        scratch_B,
+        scratch_threshold,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        B.size(1),
+        B.size(2),
+        EM,
+        num_tokens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        scratch_B.stride(0),  # scratch_stride_be
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        naive_block_assignment=(sorted_token_ids is None),
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         **config,
     )
@@ -1998,6 +2206,9 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        scratch_w13: torch.Tensor | None = None,
+        scratch_w2: torch.Tensor | None = None,
+        scratch_threshold: int = 0,
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
@@ -2018,6 +2229,31 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             torch.float8_e4m3fn,
             torch.float8_e4m3fnuz,
         ]
+
+        # ── Scratch tensor consistency (fail-fast) ──
+        _use_scratch = scratch_w13 is not None
+        if _use_scratch:
+            assert scratch_w2 is not None, \
+                "scratch_w13 and scratch_w2 must be provided together"
+            assert scratch_threshold > 0, \
+                "scratch_threshold must be > 0 when scratch is enabled"
+            assert scratch_w13.shape[1:] == w1.shape[1:], (
+                f"scratch_w13 shape mismatch: {scratch_w13.shape[1:]} "
+                f"vs w1 {w1.shape[1:]}")
+            assert scratch_w2.shape[1:] == w2.shape[1:], (
+                f"scratch_w2 shape mismatch: {scratch_w2.shape[1:]} "
+                f"vs w2 {w2.shape[1:]}")
+            assert not self.quant_config.use_fp8_w8a8, \
+                "Scratch kernel only supports unquantized"
+            assert not self.quant_config.use_int8_w8a8, \
+                "Scratch kernel only supports unquantized"
+            assert not self.quant_config.use_int8_w8a16, \
+                "Scratch kernel only supports unquantized"
+            assert not self.quant_config.use_int4_w4a16, \
+                "Scratch kernel only supports unquantized"
+        else:
+            assert scratch_w2 is None, \
+                "scratch_w2 provided without scratch_w13"
 
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
@@ -2061,28 +2297,59 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
 
-        invoke_fused_moe_triton_kernel(
-            hidden_states,
-            w1,
-            intermediate_cache1,
-            a1q_scale,
-            self.w1_scale,
-            None,  # topk_weights
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            False,  # mul_routed_weights
-            top_k_num,
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
-            use_int8_w8a8=self.quant_config.use_int8_w8a8,
-            use_int8_w8a16=self.quant_config.use_int8_w8a16,
-            use_int4_w4a16=self.quant_config.use_int4_w4a16,
-            per_channel_quant=self.per_act_token_quant,
-            block_shape=self.block_shape,
-            B_bias=self.w1_bias,
-        )
+        if _EXPERT_DEBUG and _use_scratch:
+            _scratch_call_count = getattr(self, '_scratch_call_count', 0) + 1
+            self._scratch_call_count = _scratch_call_count
+            if _scratch_call_count <= 1 or _scratch_call_count % 100 == 0:
+                logger.info(
+                    "TritonExperts scratch[%d]: expert_ids min=%d max=%d, "
+                    "scratch_blocks=%d (>=%d), num_tokens_pp=%d",
+                    _scratch_call_count,
+                    expert_ids.min().item(), expert_ids.max().item(),
+                    (expert_ids >= scratch_threshold).sum().item(),
+                    scratch_threshold,
+                    num_tokens_post_padded.item(),
+                )
+
+        if _use_scratch:
+            invoke_fused_moe_scratch_kernel(
+                hidden_states,
+                w1,
+                intermediate_cache1,
+                scratch_w13,
+                scratch_threshold,
+                None,  # topk_weights
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                False,  # mul_routed_weights
+                top_k_num,
+                config,
+                compute_type=compute_type,
+            )
+        else:
+            invoke_fused_moe_triton_kernel(
+                hidden_states,
+                w1,
+                intermediate_cache1,
+                a1q_scale,
+                self.w1_scale,
+                None,  # topk_weights
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                False,  # mul_routed_weights
+                top_k_num,
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+                use_int8_w8a8=self.quant_config.use_int8_w8a8,
+                use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                per_channel_quant=self.per_act_token_quant,
+                block_shape=self.block_shape,
+                B_bias=self.w1_bias,
+            )
 
         self.activation(
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
@@ -2098,28 +2365,45 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             self.block_shape,
         )
 
-        invoke_fused_moe_triton_kernel(
-            qintermediate_cache2,
-            w2,
-            intermediate_cache3,
-            a2q_scale,
-            self.w2_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            not apply_router_weight_on_input,
-            1,
-            config,
-            compute_type=compute_type,
-            use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
-            use_int8_w8a8=self.quant_config.use_int8_w8a8,
-            use_int8_w8a16=self.quant_config.use_int8_w8a16,
-            use_int4_w4a16=self.quant_config.use_int4_w4a16,
-            per_channel_quant=self.per_act_token_quant,
-            block_shape=self.block_shape,
-            B_bias=self.w2_bias,
-        )
+        if _use_scratch:
+            invoke_fused_moe_scratch_kernel(
+                qintermediate_cache2,
+                w2,
+                intermediate_cache3,
+                scratch_w2,
+                scratch_threshold,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                not apply_router_weight_on_input,
+                1,
+                config,
+                compute_type=compute_type,
+            )
+        else:
+            invoke_fused_moe_triton_kernel(
+                qintermediate_cache2,
+                w2,
+                intermediate_cache3,
+                a2q_scale,
+                self.w2_scale,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                not apply_router_weight_on_input,
+                1,
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+                use_int8_w8a8=self.quant_config.use_int8_w8a8,
+                use_int8_w8a16=self.quant_config.use_int8_w8a16,
+                use_int4_w4a16=self.quant_config.use_int4_w4a16,
+                per_channel_quant=self.per_act_token_quant,
+                block_shape=self.block_shape,
+                B_bias=self.w2_bias,
+            )
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output)
@@ -2184,6 +2468,9 @@ class TritonWNA16Experts(TritonExperts):
         workspace2: torch.Tensor,
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
+        scratch_w13: torch.Tensor | None = None,
+        scratch_w2: torch.Tensor | None = None,
+        scratch_threshold: int = 0,
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
@@ -2247,6 +2534,7 @@ class TritonWNA16Experts(TritonExperts):
             topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
 
+        # Note: WNA16 kernel does not support scratch tensors yet
         invoke_fused_moe_wna16_triton_kernel(
             hidden_states,
             w1,

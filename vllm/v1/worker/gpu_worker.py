@@ -340,47 +340,6 @@ class Worker(WorkerBase):
                 "max_resident_per_layer=%d invalid, clamping to 1", max_res)
             max_res = 1
 
-        # VMM auto-fit
-        if vmm_enabled and max_res >= local_E:
-            elem_size = torch.tensor([], dtype=dtype).element_size()
-            _w13n = 1
-            for d in w13_per_expert:
-                _w13n *= d
-            _w2n = 1
-            for d in w2_per_expert:
-                _w2n *= d
-            _expert_bytes = (_w13n + _w2n) * elem_size
-            _page_gran = 2 * 1024 * 1024
-            _group_size = 1
-            for gs in range(1, 9):
-                if (gs * _expert_bytes) % _page_gran == 0:
-                    _group_size = gs
-                    break
-            _group_pages = (
-                _group_size * _expert_bytes) // _page_gran
-            _per_expert_mem = (
-                _group_pages * _page_gran) / _group_size
-            _gpu_total = torch.cuda.get_device_properties(
-                self.device).total_memory
-            _usable = _gpu_total * self.cache_config.gpu_memory_utilization
-            _non_expert = (
-                torch.cuda.memory_allocated(self.device)
-                - local_E * len(moe_layers) * _expert_bytes
-            )
-            _avail_for_experts = _usable - _non_expert - 8 * (1 << 30)
-            auto_max = int(_avail_for_experts
-                           / (_per_expert_mem * len(moe_layers)))
-            auto_max = (auto_max // _group_size) * _group_size
-            auto_max = max(_group_size, min(auto_max, local_E))
-            max_res = auto_max
-            logger.info(
-                "VMM Phase C: auto max_res=%d (expert=%dB, "
-                "group_size=%d, group_pages=%d, avail=%.1fGB)",
-                max_res, _expert_bytes, _group_size, _group_pages,
-                _avail_for_experts / (1 << 30))
-        elif vmm_enabled:
-            logger.info("VMM Phase C: max_res=%d (from config)", max_res)
-
         if max_res >= local_E and not vmm_enabled:
             logger.info(
                 "max_resident_per_layer=%d >= local_experts=%d, "
@@ -636,9 +595,149 @@ class Worker(WorkerBase):
             if hasattr(module, '_cache_map') and module._cache_map is not None:
                 cache._update_cache_map(layer_idx, module)
 
+        # Always store MoE layer refs — needed for O2 emap cache,
+        # lookahead prefetch, and any future per-layer metadata.
+        # Must be unconditional (not gated on scratch/eager config).
+        cache.set_moe_layers(moe_layers)
+
+        # ── Scratch bank: shared overflow buffer for hard guarantee ──
+        scratch_capacity = int(os.environ.get(
+            "VLLM_EXPERT_SCRATCH_CAPACITY", "0"))
+        if scratch_capacity > 0:
+            # Assert all MoE layers have identical w13/w2 shapes and dtype.
+            # Single shared scratch tensor requires this.
+            for li, mod in enumerate(moe_layers):
+                assert mod.w13_weight.shape[1:] == tuple(w13_per_expert), (
+                    f"Layer {li} w13 shape {mod.w13_weight.shape[1:]} != "
+                    f"ref {tuple(w13_per_expert)}")
+                assert mod.w2_weight.shape[1:] == tuple(w2_per_expert), (
+                    f"Layer {li} w2 shape {mod.w2_weight.shape[1:]} != "
+                    f"ref {tuple(w2_per_expert)}")
+                assert mod.w13_weight.dtype == dtype, (
+                    f"Layer {li} dtype {mod.w13_weight.dtype} != {dtype}")
+
+            num_banks = int(os.environ.get("VLLM_SCRATCH_BANKS", "2"))
+            if os.environ.get("VLLM_FIXED_TAIL", "0") == "1":
+                num_banks = 2  # fixed-tail requires double-buffer
+            if os.environ.get("VLLM_STEP_BOUNDARY", "0") == "1":
+                num_banks = 2  # step-boundary requires double-buffer
+                # PoC scope: TP4 full-cover only
+                # (max_tail ≤ scratch_capacity enforced at activation)
+                if scratch_capacity < local_E:
+                    logger.warning(
+                        "[StepBoundary] scratch_capacity=%d < "
+                        "local_num_experts=%d. TP4 full-cover requires "
+                        "scratch ≥ max possible tail. Non-TP4 setups may "
+                        "hit assert at activation.",
+                        scratch_capacity, local_E)
+            if os.environ.get("VLLM_CUTOFF_BOUNDARY", "0") == "1":
+                num_banks = 2  # cutoff-boundary requires double-buffer
+            if (os.environ.get("VLLM_FIXED_TAIL", "0") == "1"
+                    and os.environ.get("VLLM_STEP_BOUNDARY", "0") == "1"):
+                raise ValueError(
+                    "VLLM_FIXED_TAIL and VLLM_STEP_BOUNDARY are "
+                    "mutually exclusive")
+            if (os.environ.get("VLLM_CUTOFF_BOUNDARY", "0") == "1"
+                    and os.environ.get("VLLM_FIXED_TAIL", "0") == "1"):
+                raise ValueError(
+                    "VLLM_FIXED_TAIL and VLLM_CUTOFF_BOUNDARY are "
+                    "mutually exclusive")
+            if (os.environ.get("VLLM_CUTOFF_BOUNDARY", "0") == "1"
+                    and os.environ.get("VLLM_STEP_BOUNDARY", "0") == "1"):
+                raise ValueError(
+                    "VLLM_STEP_BOUNDARY and VLLM_CUTOFF_BOUNDARY are "
+                    "mutually exclusive")
+            scratch_w13 = torch.empty(
+                (num_banks * scratch_capacity, *w13_per_expert),
+                dtype=dtype, device=self.device)
+            scratch_w2 = torch.empty(
+                (num_banks * scratch_capacity, *w2_per_expert),
+                dtype=dtype, device=self.device)
+            cache.set_scratch(
+                scratch_w13, scratch_w2,
+                threshold=max_res,
+                capacity=scratch_capacity,
+                num_banks=num_banks)
+            scratch_bytes = (scratch_w13.nbytes + scratch_w2.nbytes)
+            logger.info(
+                "Scratch bank: capacity=%d threshold=%d "
+                "w13=%s w2=%s %.1fMB GPU=%.1fGB",
+                scratch_capacity, max_res,
+                list(scratch_w13.shape), list(scratch_w2.shape),
+                scratch_bytes / (1 << 20),
+                torch.cuda.memory_allocated(self.device) / (1 << 30))
+
         # Store references for pre_step() and elastic KV
         self.model_runner._expert_cache = cache
         self.model_runner._expert_cache_layers = moe_layers
+        if self.model_runner._expert_miss_log:
+            cache._collect_routing_freq = True
+
+        # Eager routing: per-layer graph boundary for fresh routing sync
+        # Separate prefill/decode control:
+        #   VLLM_EXPERT_EAGER_ROUTING_PREFILL="all" or "0,1,2"
+        #   VLLM_EXPERT_EAGER_ROUTING_DECODE="0" or "0,47"
+        # Legacy single var still supported as both-phase shorthand:
+        #   VLLM_EXPERT_EAGER_ROUTING_LAYERS="all" → prefill all + decode all
+        def _parse_layer_set(env_val: str) -> set:
+            if not env_val:
+                return set()
+            if env_val.strip().lower() == "all":
+                return set(range(len(moe_layers)))
+            return {int(x) for x in env_val.split(",") if x.strip()}
+
+        legacy_str = os.environ.get(
+            "VLLM_EXPERT_EAGER_ROUTING_LAYERS", "")
+        prefill_str = os.environ.get(
+            "VLLM_EXPERT_EAGER_ROUTING_PREFILL", "")
+        decode_str = os.environ.get(
+            "VLLM_EXPERT_EAGER_ROUTING_DECODE", "")
+
+        # Legacy fallback: if new vars not set, use legacy for both phases
+        if not prefill_str and not decode_str and legacy_str:
+            prefill_str = legacy_str
+            decode_str = legacy_str
+
+        prefill_set = _parse_layer_set(prefill_str)
+        decode_set = _parse_layer_set(decode_str)
+
+        # Fixed-tail requires ALL layers to have eager decode boundary
+        # so that _fixed_tail_prefetch_next() is called for every layer.
+        if os.environ.get("VLLM_FIXED_TAIL", "0") == "1":
+            all_layers = set(range(len(moe_layers)))
+            prefill_set = prefill_set or all_layers
+            decode_set = all_layers
+            logger.info(
+                "VLLM_FIXED_TAIL=1: forcing decode eager routing to ALL "
+                "(%d layers)", len(moe_layers))
+
+        if prefill_set or decode_set:
+            for layer_idx, mod in enumerate(moe_layers):
+                if layer_idx in prefill_set:
+                    mod._use_eager_routing_prefill = True
+                if layer_idx in decode_set:
+                    mod._use_eager_routing_decode = True
+            logger.info(
+                "Expert eager routing: prefill=%s decode=%s (%d layers)",
+                "all" if len(prefill_set) == len(moe_layers)
+                else sorted(prefill_set) if prefill_set else "off",
+                "all" if len(decode_set) == len(moe_layers)
+                else sorted(decode_set) if decode_set else "off",
+                len(moe_layers))
+
+        # 3-D: Group boundary — async prefetch between MoE layer groups
+        group_size = int(os.environ.get("VLLM_EXPERT_GROUP_SIZE", "0"))
+        if group_size > 0:
+            num_moe = len(moe_layers)
+            cache._group_ranges = [
+                list(range(g * group_size,
+                           min((g + 1) * group_size, num_moe)))
+                for g in range((num_moe + group_size - 1) // group_size)
+            ]
+            logger.info(
+                "Expert group boundaries: size=%d, %d groups, ranges=%s",
+                group_size, len(cache._group_ranges),
+                [(r[0], r[-1]) for r in cache._group_ranges])
 
         # Memory accounting
         if vmm_enabled and hasattr(self.model_runner, 'model_memory_usage'):

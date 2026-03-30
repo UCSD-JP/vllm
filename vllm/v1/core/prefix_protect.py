@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prefix Protection V4 cost model — work-conserving decision (Ce / Cc / Cp).
+"""Prefix Protection V4 cost model — work-conserving decision (Ce/Cc/Cp/Cb).
 
 Ce = Cost_expert_evict  — per-token DMA reload stall from evicted experts
 Cc = Cost_cached_reclaim — re-prefilling destroyed prefix cache blocks
 Cp = Cost_req_preempt   — recomputing preempted request tokens
+Cb = Cost_partial_expand — MPC first-action: floor expand + reclaim remainder
 
 Decision:
-  USE_UNCACHED         — uncached free blocks suffice, no cost
-  PROTECT_AND_EXPAND   — Ce is cheapest: expand KV via expert eviction
-  RECLAIM_CACHED       — Cc is cheapest: reclaim cached blocks
-  PREEMPT              — Cp is cheapest: preempt a running request
+  USE_UNCACHED                — uncached free blocks suffice, no cost
+  PROTECT_AND_EXPAND          — Ce is cheapest: expand KV via expert eviction
+  RECLAIM_CACHED              — Cc is cheapest: reclaim cached blocks
+  PREEMPT                     — Cp is cheapest: preempt a running request
+  PARTIAL_EXPAND_AND_RECLAIM  — Cb is cheapest: partial expand + reclaim rest
 
-All callers use 3-way Ce/Cc/Cp. Fallback is RECLAIM_CACHED.
+4-way argmin(Ce, Cc, Cp, Cb). Cb degenerates to inf when floor=0.
+Fallback is RECLAIM_CACHED.
 
 V4 Ce (traffic-bound, per-token amortized):
   rho  = (groups_to_evict × G) / E        — miss rate (uniform routing)
@@ -42,11 +45,12 @@ class ProtectionDecision(Enum):
     PROTECT_AND_EXPAND = "protect_and_expand"
     RECLAIM_CACHED = "reclaim_cached"
     PREEMPT = "preempt"         # preempt another victim
+    PARTIAL_EXPAND_AND_RECLAIM = "partial_expand_and_reclaim"
 
 
 @dataclass
 class PrefixProtectionConfig:
-    """V4 3-way prefix protection cost model configuration."""
+    """V4 4-way prefix protection cost model configuration (Ce/Cc/Cp/Cb)."""
 
     # --- Ce parameters (V4 traffic-bound) ---
     local_num_experts: int = 512   # E: number of local experts
@@ -68,6 +72,9 @@ class PrefixProtectionConfig:
     cc_hit_threshold: float = 0.0  # hit_rate threshold below which gamma applies
     t_sched_us: float = 500.0      # scheduler overhead (µs)
     t_queue_us: float = 1000.0     # queue overhead (µs)
+
+    # --- Decode-freeze (step-boundary mode) ---
+    decode_freeze_expand: bool = True  # VLLM_PP_DECODE_FREEZE (default ON)
 
     enable: bool = False
 
@@ -100,6 +107,8 @@ class PrefixProtectionConfig:
                 os.environ.get("VLLM_PP_CC_GAMMA", "1.0")),
             cc_hit_threshold=float(
                 os.environ.get("VLLM_PP_CC_HIT_THRESHOLD", "0.0")),
+            decode_freeze_expand=(
+                os.environ.get("VLLM_PP_DECODE_FREEZE", "1") == "1"),
         )
 
     # ------------------------------------------------------------------ #
@@ -163,26 +172,29 @@ class PrefixProtectionConfig:
             touched_cached_blocks * self.block_size * self.t_prefill_tok_us
             + self.t_sched_us + self.t_queue_us)
 
-    def compute_cp_running(self, victim_computed_tokens: int) -> float:
+    def compute_cp_running(self, victim_computed_tokens: int,
+                           t_queue_override: float | None = None) -> float:
         """Running victim preemption cost (microseconds).
 
         Model: preempting frees full blocks (-> cached queue, handled by Cc)
         + at most 1 partial tail block (-> uncached queue).
-        Cost = scheduler overhead + partial_tail_tokens * t_prefill_tok_us.
+        Cost = scheduler overhead + queue delay + partial tail replay.
         If no partial tail (computed % block_size == 0), uncached_yield=0
         -> Cp=inf (useless preemption for uncached deficit).
 
-        NOTE (POC): Cp is estimated from the best-yield victim across running,
-        but actual preemption follows scheduler policy (FIFO/Priority) — the
-        two victims may differ.  Accepted mismatch for POC scope.
+        Args:
+            victim_computed_tokens: Computed tokens of preempt victim.
+            t_queue_override: Measured queue delay EMA (µs). When provided,
+                replaces static t_queue_us for runtime-calibrated Cp.
         """
         if victim_computed_tokens <= 0:
             return 0.0
         partial_tail_tokens = victim_computed_tokens % self.block_size
         if partial_tail_tokens == 0:
             return float('inf')  # no uncached yield -> useless preemption
-        # Cost = scheduling overhead + partial tail token replay
-        return (self.t_sched_us + self.t_queue_us
+        t_queue = (t_queue_override
+                   if t_queue_override is not None else self.t_queue_us)
+        return (self.t_sched_us + t_queue
                 + partial_tail_tokens * self.t_prefill_tok_us)
 
     # ------------------------------------------------------------------ #
@@ -198,12 +210,18 @@ class PrefixProtectionConfig:
                hit_rate: float | None = None,
                recency_age: float = 0.0,
                protection_gap: int = 0,
+               floor_expand_groups: int = 0,
+               floor_expand_blocks: int = 0,
+               t_queue_override: float | None = None,
+               has_decode: bool = False,
                ) -> ProtectionDecision:
-        """Work-conserving 3-way cost selection (Ce/Cc/Cp).
+        """Work-conserving 4-way cost selection (Ce/Cc/Cp/Cb).
 
-        All callers use the same 3-way comparison.  Ce and Cc price the
-        full deficit; Cp is normalized by protection_gap (number of
-        preempts needed, since each yields at most 1 uncached block).
+        4-way argmin over corner solutions + Plan B (partial expand):
+          Ce — full expand cost
+          Cc — full cached reclaim cost
+          Cp — gap-normalized preempt cost
+          Cb — MPC first-action: Ce_floor + Cc_remainder (inf when floor=0)
         Fallback is RECLAIM_CACHED (progress guaranteed, no DEFER).
 
         Args:
@@ -225,6 +243,10 @@ class PrefixProtectionConfig:
             protection_gap: Uncached block deficit (= required - noncached_free).
                 Used to normalize Cp: each preempt yields ~1 block,
                 so Cp_total = Cp_single × protection_gap.
+            floor_expand_groups: Quantum-floored group count for Plan B.
+                0 → Cb=inf → degenerates to 3-way.
+            floor_expand_blocks: KV blocks from floor_expand_groups.
+                0 → Cb=inf.
 
         Returns:
             ProtectionDecision enum.
@@ -232,13 +254,17 @@ class PrefixProtectionConfig:
         if protection_gap <= 0 and touched_cached_blocks == 0:
             return ProtectionDecision.USE_UNCACHED
 
+        # Decode-freeze: block expert eviction when decode tokens present
+        _can_expand = (can_fully_protect
+                       and not (self.decode_freeze_expand and has_decode))
         Ce = (self.compute_ce(h_eff, groups_to_evict, n_decode, n_prefill)
-              if can_fully_protect else float('inf'))
+              if _can_expand else float('inf'))
         # Cc is inf when no cached blocks exist to reclaim
         Cc = (self.compute_cc(touched_cached_blocks, hit_rate=hit_rate,
                               recency_age=recency_age)
               if touched_cached_blocks > 0 else float('inf'))
-        Cp_single = self.compute_cp_running(preempt_computed_tokens)
+        Cp_single = self.compute_cp_running(
+            preempt_computed_tokens, t_queue_override=t_queue_override)
         if Cp_single <= 0:
             Cp_single = float('inf')
         # Each preempt yields at most 1 uncached block (partial tail).
@@ -247,9 +273,27 @@ class PrefixProtectionConfig:
                   else touched_cached_blocks)
         Cp = Cp_single * gap
 
-        if Ce <= Cc and Ce <= Cp:
-            return ProtectionDecision.PROTECT_AND_EXPAND
-        if Cc <= Ce and Cc <= Cp:
-            return ProtectionDecision.RECLAIM_CACHED
-        return ProtectionDecision.PREEMPT  # Cp cheapest, all callers
+        # Plan B: partial expand (quantum floor) + reclaim remainder
+        # (MPC first-action cost estimate)
+        # Also blocked by decode-freeze (partial expand still evicts experts)
+        Cb = float('inf')
+        if (floor_expand_groups > 0 and floor_expand_blocks > 0
+                and _can_expand):
+            remainder = max(0, gap - floor_expand_blocks)
+            if remainder > 0 and touched_cached_blocks > 0:
+                Ce_floor = self.compute_ce(
+                    h_eff, floor_expand_groups, n_decode, n_prefill)
+                Cc_rem = self.compute_cc(
+                    min(remainder, touched_cached_blocks),
+                    hit_rate=hit_rate, recency_age=recency_age)
+                Cb = Ce_floor + Cc_rem
+
+        costs = [
+            (Ce, ProtectionDecision.PROTECT_AND_EXPAND),
+            (Cc, ProtectionDecision.RECLAIM_CACHED),
+            (Cp, ProtectionDecision.PREEMPT),
+            (Cb, ProtectionDecision.PARTIAL_EXPAND_AND_RECLAIM),
+        ]
+        _, best = min(costs, key=lambda x: x[0])
+        return best
 
