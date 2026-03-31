@@ -167,6 +167,8 @@ class _ScratchBank:
     prewarmed_lids: Optional[List[int]] = None
     gid_to_slot: Optional[Dict[int, int]] = None
     consumed_gids: Optional[List[int]] = None
+    # Split prefetch: w13 done before w2
+    w13_ready_event: Optional[torch.cuda.Event] = None
     n_prewarmed: int = 0
 
 
@@ -340,6 +342,9 @@ class ExpertCacheManager:
         self._sb_tail_lids: List[List[int]] = []   # per-layer non-resident lids
         self._sb_tail_gids: List[List[int]] = []   # per-layer non-resident gids
         self._sb_current_bank: int = 0
+
+        # ── TP-size (set by gpu_worker, default 1) ──
+        self._tp_size: int = 1
 
         # ── Cutoff-boundary (VLLM_CUTOFF_BOUNDARY=1) ──
         self._cutoff_verified: bool = False   # True after first verification (pass or fail)
@@ -933,7 +938,8 @@ class ExpertCacheManager:
         Uses the same greedy cumulative floor guard as _select_lru_victims
         to guarantee prepare never over-promises vs commit.
         """
-        if _CUTOFF_BOUNDARY and self._cutoff_verify_once():
+        if (_CUTOFF_BOUNDARY
+                and self._cutoff_verify_once()):
             return self._cutoff_count_evictable_groups()
         if not self._can_shrink():
             return 0
@@ -950,7 +956,8 @@ class ExpertCacheManager:
         Returns:
             (freed_pages, groups_evicted)
         """
-        if _CUTOFF_BOUNDARY and self._cutoff_verify_once():
+        if (_CUTOFF_BOUNDARY
+                and self._cutoff_verify_once()):
             return self._cutoff_shrink(min_pages)
         if self._fixed_tail_active:
             logger.debug(
@@ -1092,7 +1099,8 @@ class ExpertCacheManager:
                     'miss_ratio': 0.0, 'layer_stats': []}
 
         # ── Cutoff-boundary mode ──
-        if (_CUTOFF_BOUNDARY and self._scratch_banks
+        if (_CUTOFF_BOUNDARY
+                and self._scratch_banks
                 and len(self._scratch_banks) >= 2
                 and self._cutoff_verify_once()):
             if not self._cutoff_active:
@@ -1117,7 +1125,8 @@ class ExpertCacheManager:
                         'miss_ratio': 0.0, 'layer_stats': []}
 
         # ── Step-boundary static topology ──
-        if (_STEP_BOUNDARY and self._scratch_banks
+        if (_STEP_BOUNDARY
+                and self._scratch_banks
                 and len(self._scratch_banks) >= 2):
             # Activation: first time non-resident experts detected
             if not self._static_topo_active:
@@ -1986,12 +1995,14 @@ class ExpertCacheManager:
             done_ev.record()
             gid_buf = torch.empty(
                 capacity, dtype=torch.int64, device=self.device)
+            w13_ready_ev = torch.cuda.Event()
             bank = _ScratchBank(
                 w13=scratch_w13[off:off + capacity],
                 w2=scratch_w2[off:off + capacity],
                 ready_event=ready_ev,
                 done_event=done_ev,
                 gid_buffer=gid_buf,
+                w13_ready_event=w13_ready_ev,
             )
             self._scratch_banks.append(bank)
 
@@ -2298,8 +2309,12 @@ class ExpertCacheManager:
         self._copy_stream.wait_event(bank.done_event)
         with torch.cuda.stream(self._copy_stream):
             for i, lid in enumerate(tail_lids):
-                w13_cpu, w2_cpu = self._cpu_pool[first_li][lid]
+                w13_cpu, _ = self._cpu_pool[first_li][lid]
                 bank.w13[i].copy_(w13_cpu, non_blocking=True)
+            if bank.w13_ready_event is not None:
+                bank.w13_ready_event.record(self._copy_stream)
+            for i, lid in enumerate(tail_lids):
+                _, w2_cpu = self._cpu_pool[first_li][lid]
                 bank.w2[i].copy_(w2_cpu, non_blocking=True)
             bank.ready_event.record(self._copy_stream)
 
@@ -2347,8 +2362,12 @@ class ExpertCacheManager:
         self._copy_stream.wait_event(bank.done_event)
         with torch.cuda.stream(self._copy_stream):
             for i, lid in enumerate(tail_lids):
-                w13_cpu, w2_cpu = self._cpu_pool[next_idx][lid]
+                w13_cpu, _ = self._cpu_pool[next_idx][lid]
                 bank.w13[i].copy_(w13_cpu, non_blocking=True)
+            if bank.w13_ready_event is not None:
+                bank.w13_ready_event.record(self._copy_stream)
+            for i, lid in enumerate(tail_lids):
+                _, w2_cpu = self._cpu_pool[next_idx][lid]
                 bank.w2[i].copy_(w2_cpu, non_blocking=True)
             bank.ready_event.record(self._copy_stream)
 
@@ -2527,9 +2546,15 @@ class ExpertCacheManager:
         bank.state = _BankState.FILLING
         self._copy_stream.wait_event(bank.done_event)
         with torch.cuda.stream(self._copy_stream):
+            # w13 first → record w13_ready_event → w2 → record ready_event
+            # Allows w1 kernel to start while w2 is still copying.
             for i, lid in enumerate(tail):
-                w13_cpu, w2_cpu = self._cpu_pool[next_idx][lid]
+                w13_cpu, _ = self._cpu_pool[next_idx][lid]
                 bank.w13[i].copy_(w13_cpu, non_blocking=True)
+            if bank.w13_ready_event is not None:
+                bank.w13_ready_event.record(self._copy_stream)
+            for i, lid in enumerate(tail):
+                _, w2_cpu = self._cpu_pool[next_idx][lid]
                 bank.w2[i].copy_(w2_cpu, non_blocking=True)
             bank.ready_event.record(self._copy_stream)
 

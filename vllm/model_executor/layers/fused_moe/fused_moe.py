@@ -2209,6 +2209,7 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         scratch_w13: torch.Tensor | None = None,
         scratch_w2: torch.Tensor | None = None,
         scratch_threshold: int = 0,
+        w2_ready_event: "torch.cuda.Event | None" = None,
     ):
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
@@ -2251,6 +2252,28 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
                 "Scratch kernel only supports unquantized"
             assert not self.quant_config.use_int4_w4a16, \
                 "Scratch kernel only supports unquantized"
+            # Stride/layout sanity (VLLM_CORRUPTION_CHECK gated)
+            # Kernel reuses resident w1's stride_bk/stride_bn for scratch
+            # inner dims (fused_moe.py:937,940). Only scratch_stride_be
+            # (stride(0)) is passed separately. So inner strides MUST match.
+            if os.environ.get("VLLM_CORRUPTION_CHECK", "0") == "1":
+                assert scratch_w13.ndim == 3, (
+                    f"scratch_w13 ndim={scratch_w13.ndim}, expected 3")
+                assert scratch_w2.ndim == 3, (
+                    f"scratch_w2 ndim={scratch_w2.ndim}, expected 3")
+                assert scratch_w13.stride(0) > 0, (
+                    f"scratch_w13 stride(0)={scratch_w13.stride(0)}")
+                assert scratch_w2.stride(0) > 0, (
+                    f"scratch_w2 stride(0)={scratch_w2.stride(0)}")
+                assert scratch_w13.shape[0] > 0, (
+                    f"scratch_w13 n_experts={scratch_w13.shape[0]}")
+                # Inner stride equality: scratch must match resident
+                assert scratch_w13.stride()[1:] == w1.stride()[1:], (
+                    f"scratch_w13 inner stride mismatch: "
+                    f"{scratch_w13.stride()[1:]} vs w1 {w1.stride()[1:]}")
+                assert scratch_w2.stride()[1:] == w2.stride()[1:], (
+                    f"scratch_w2 inner stride mismatch: "
+                    f"{scratch_w2.stride()[1:]} vs w2 {w2.stride()[1:]}")
         else:
             assert scratch_w2 is None, \
                 "scratch_w2 provided without scratch_w13"
@@ -2364,6 +2387,11 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             self.per_act_token_quant,
             self.block_shape,
         )
+
+        # Split prefetch: wait for w2 copy before w2 kernel.
+        # w1 kernel + activation ran while w2 was still copying.
+        if w2_ready_event is not None:
+            torch.cuda.current_stream().wait_event(w2_ready_event)
 
         if _use_scratch:
             invoke_fused_moe_scratch_kernel(

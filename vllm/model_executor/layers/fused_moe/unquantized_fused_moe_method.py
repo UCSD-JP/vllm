@@ -382,13 +382,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             _ev_entry.record()
             _cur_layer = getattr(layer, '_expert_cache_layer_idx', -1)
 
+        _w2_ready_event = None
         if _scratch_active and _active_bank is not None:
-            # Wait for H2D copies to complete on copy_stream (per-bank)
+            # Split prefetch: wait on w13_ready_event only (w2 may still
+            # be copying). Pass w2 ready_event to kernel for deferred wait.
             if _kp_active:
                 _ev_wait_s = torch.cuda.Event(enable_timing=True)
                 _ev_wait_e = torch.cuda.Event(enable_timing=True)
                 _ev_wait_s.record()
-            torch.cuda.current_stream().wait_event(_active_bank.ready_event)
+            _has_split = (getattr(_active_bank, 'w13_ready_event', None)
+                          is not None
+                          and getattr(_ec, '_tp_size', 99) <= 2
+                          and (getattr(_ec, '_cutoff_active', False)
+                               or getattr(_ec, '_static_topo_active', False)))
+            if _has_split:
+                torch.cuda.current_stream().wait_event(
+                    _active_bank.w13_ready_event)
+                _w2_ready_event = _active_bank.ready_event
+            else:
+                torch.cuda.current_stream().wait_event(
+                    _active_bank.ready_event)
             if _kp_active:
                 _ev_wait_e.record()
 
@@ -451,6 +464,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             scratch_w13=_active_bank.w13 if _scratch_active else None,
             scratch_w2=_active_bank.w2 if _scratch_active else None,
             scratch_threshold=_ec._scratch_threshold if _scratch_active else 0,
+            w2_ready_event=_w2_ready_event,
         )
 
         if _kp_active:

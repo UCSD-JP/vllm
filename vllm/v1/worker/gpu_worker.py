@@ -599,6 +599,7 @@ class Worker(WorkerBase):
         # lookahead prefetch, and any future per-layer metadata.
         # Must be unconditional (not gated on scratch/eager config).
         cache.set_moe_layers(moe_layers)
+        cache._tp_size = self.vllm_config.parallel_config.tensor_parallel_size
 
         # ── Scratch bank: shared overflow buffer for hard guarantee ──
         scratch_capacity = int(os.environ.get(

@@ -1150,6 +1150,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         scratch_w13: torch.Tensor | None = None,
         scratch_w2: torch.Tensor | None = None,
         scratch_threshold: int = 0,
+        w2_ready_event: "torch.cuda.Event | None" = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1228,6 +1229,7 @@ class FusedMoEModularKernel(torch.nn.Module):
                 scratch_w13=scratch_w13,
                 scratch_w2=scratch_w2,
                 scratch_threshold=scratch_threshold,
+                w2_ready_event=w2_ready_event,
             )
 
         return fused_out
@@ -1314,6 +1316,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         scratch_w13: torch.Tensor | None = None,
         scratch_w2: torch.Tensor | None = None,
         scratch_threshold: int = 0,
+        w2_ready_event: "torch.cuda.Event | None" = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1338,6 +1341,8 @@ class FusedMoEModularKernel(torch.nn.Module):
         - apply_router_weight_on_input (bool): When true, the topk weights are
           applied directly on the inputs. This is only applicable when topk is
           1.
+        - w2_ready_event: If set, compute stream waits on this event before
+          w2 matmul (split w13/w2 prefetch overlap).
 
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
@@ -1378,6 +1383,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             scratch_w13=scratch_w13,
             scratch_w2=scratch_w2,
             scratch_threshold=scratch_threshold,
+            w2_ready_event=w2_ready_event,
         )
 
         return self._finalize(
