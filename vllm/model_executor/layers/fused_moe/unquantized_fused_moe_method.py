@@ -46,6 +46,8 @@ else:
 logger = init_logger(__name__)
 
 import os
+
+_CORRUPTION_CHECK = os.environ.get("VLLM_CORRUPTION_CHECK", "0") == "1"
 _EXPERT_DEBUG = os.environ.get("VLLM_EXPERT_DEBUG", "0") == "1"
 _KERNEL_PROFILE = os.environ.get("VLLM_KERNEL_PROFILE", "0") == "1"
 
@@ -415,10 +417,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             _ec.cutoff_prefetch_next(
                 getattr(layer, '_expert_cache_layer_idx', -1))
 
-        # ── CacheMap -1 detection: log when kernel would zero expert contrib ──
-        # Skip in fixed-tail: static map is correct by construction,
-        # and .item() here would defeat the zero-sync goal.
-        if (_ec is not None and layer._cache_map is not None
+        # ── CacheMap -1 detection (VLLM_CORRUPTION_CHECK=1 only) ──
+        # GPU sync via .item() — disabled by default for performance.
+        if (_CORRUPTION_CHECK
+                and _ec is not None and layer._cache_map is not None
                 and not torch.cuda.is_current_stream_capturing()
                 and not getattr(_ec, '_fixed_tail_active', False)
                 and not getattr(_ec, '_static_topo_active', False)
@@ -470,16 +472,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if _kp_active:
             _ev_k_e.record()
 
-        # ── NaN/Inf probe: detect corrupted MoE output ──
-        # Skip during CUDA graph capture/warmup (dummy data → NaN expected)
-        # Skip in static topo mode (no .item() on forward hot path)
-        _static_probe = os.environ.get("VLLM_STATIC_PROBE", "0") == "1"
-        if (_ec is not None
+        # ── NaN/Inf probe (VLLM_CORRUPTION_CHECK=1 only) ──
+        # GPU sync via .item() — disabled by default for performance.
+        if (_CORRUPTION_CHECK
+                and _ec is not None
                 and not torch.cuda.is_current_stream_capturing()
                 and getattr(_ec, '_batched_d2h_ready', False)
                 and (not (getattr(_ec, '_static_topo_active', False)
                          or getattr(_ec, '_cutoff_active', False))
-                     or _static_probe)):
+                     or os.environ.get("VLLM_STATIC_PROBE", "0") == "1")):
             _out = result[0] if isinstance(result, tuple) else result
             if _out is not None and _out.numel() > 0:
                 _has_nan = torch.isnan(_out).any().item()
