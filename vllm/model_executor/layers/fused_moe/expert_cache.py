@@ -2307,15 +2307,22 @@ class ExpertCacheManager:
 
         bank.state = _BankState.FILLING
         self._copy_stream.wait_event(bank.done_event)
+        _split = self._tp_size <= 2
         with torch.cuda.stream(self._copy_stream):
-            for i, lid in enumerate(tail_lids):
-                w13_cpu, _ = self._cpu_pool[first_li][lid]
-                bank.w13[i].copy_(w13_cpu, non_blocking=True)
-            if bank.w13_ready_event is not None:
-                bank.w13_ready_event.record(self._copy_stream)
-            for i, lid in enumerate(tail_lids):
-                _, w2_cpu = self._cpu_pool[first_li][lid]
-                bank.w2[i].copy_(w2_cpu, non_blocking=True)
+            if _split:
+                for i, lid in enumerate(tail_lids):
+                    w13_cpu, _ = self._cpu_pool[first_li][lid]
+                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                if bank.w13_ready_event is not None:
+                    bank.w13_ready_event.record(self._copy_stream)
+                for i, lid in enumerate(tail_lids):
+                    _, w2_cpu = self._cpu_pool[first_li][lid]
+                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
+            else:
+                for i, lid in enumerate(tail_lids):
+                    w13_cpu, w2_cpu = self._cpu_pool[first_li][lid]
+                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
             bank.ready_event.record(self._copy_stream)
 
         bank.state = _BankState.READY
@@ -2360,15 +2367,22 @@ class ExpertCacheManager:
         n = len(tail_lids)
         bank.state = _BankState.FILLING
         self._copy_stream.wait_event(bank.done_event)
+        _split = self._tp_size <= 2
         with torch.cuda.stream(self._copy_stream):
-            for i, lid in enumerate(tail_lids):
-                w13_cpu, _ = self._cpu_pool[next_idx][lid]
-                bank.w13[i].copy_(w13_cpu, non_blocking=True)
-            if bank.w13_ready_event is not None:
-                bank.w13_ready_event.record(self._copy_stream)
-            for i, lid in enumerate(tail_lids):
-                _, w2_cpu = self._cpu_pool[next_idx][lid]
-                bank.w2[i].copy_(w2_cpu, non_blocking=True)
+            if _split:
+                for i, lid in enumerate(tail_lids):
+                    w13_cpu, _ = self._cpu_pool[next_idx][lid]
+                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                if bank.w13_ready_event is not None:
+                    bank.w13_ready_event.record(self._copy_stream)
+                for i, lid in enumerate(tail_lids):
+                    _, w2_cpu = self._cpu_pool[next_idx][lid]
+                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
+            else:
+                for i, lid in enumerate(tail_lids):
+                    w13_cpu, w2_cpu = self._cpu_pool[next_idx][lid]
+                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
             bank.ready_event.record(self._copy_stream)
 
         bank.state = _BankState.READY
@@ -2545,17 +2559,24 @@ class ExpertCacheManager:
             f"{bank.state.name}")
         bank.state = _BankState.FILLING
         self._copy_stream.wait_event(bank.done_event)
+        _split = self._tp_size <= 2
         with torch.cuda.stream(self._copy_stream):
-            # w13 first → record w13_ready_event → w2 → record ready_event
-            # Allows w1 kernel to start while w2 is still copying.
-            for i, lid in enumerate(tail):
-                w13_cpu, _ = self._cpu_pool[next_idx][lid]
-                bank.w13[i].copy_(w13_cpu, non_blocking=True)
-            if bank.w13_ready_event is not None:
-                bank.w13_ready_event.record(self._copy_stream)
-            for i, lid in enumerate(tail):
-                _, w2_cpu = self._cpu_pool[next_idx][lid]
-                bank.w2[i].copy_(w2_cpu, non_blocking=True)
+            if _split:
+                # w13 first → record w13_ready_event → w2 → record ready_event
+                # Allows w1 kernel to start while w2 is still copying.
+                for i, lid in enumerate(tail):
+                    w13_cpu, _ = self._cpu_pool[next_idx][lid]
+                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                if bank.w13_ready_event is not None:
+                    bank.w13_ready_event.record(self._copy_stream)
+                for i, lid in enumerate(tail):
+                    _, w2_cpu = self._cpu_pool[next_idx][lid]
+                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
+            else:
+                for i, lid in enumerate(tail):
+                    w13_cpu, w2_cpu = self._cpu_pool[next_idx][lid]
+                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
             bank.ready_event.record(self._copy_stream)
 
         bank.state = _BankState.READY
