@@ -44,6 +44,7 @@ _EAGER_BREAKDOWN = os.environ.get("VLLM_EAGER_BREAKDOWN", "0") == "1"
 _FIXED_TAIL = os.environ.get("VLLM_FIXED_TAIL", "0") == "1"
 _STEP_BOUNDARY = os.environ.get("VLLM_STEP_BOUNDARY", "0") == "1"
 _CUTOFF_BOUNDARY = os.environ.get("VLLM_CUTOFF_BOUNDARY", "0") == "1"
+_CB_PACKED_TAIL = os.environ.get("VLLM_CB_PACKED_TAIL", "0") == "1"
 
 # ── Eager breakdown accumulators (VLLM_EAGER_BREAKDOWN=1) ──
 if _EAGER_BREAKDOWN:
@@ -353,6 +354,11 @@ class ExpertCacheManager:
         self._resident_cutoff: int = local_num_experts  # init: all resident
         self._cutoff_tail_lids: List[int] = []  # shared across L1..L47
         self._cutoff_current_bank: int = 0
+        # Packed tail: contiguous pinned buffers for slice copy (built at init)
+        self._packed_w13: Optional[List[Optional[torch.Tensor]]] = None
+        self._packed_w2: Optional[List[Optional[torch.Tensor]]] = None
+        self._cutoff_tail_base: int = 0  # = max(0, localE - scratch_cap)
+        self._packed_tail_active: bool = False  # True after build+delete
 
     # ================================================================
     # Backward-compatible scratch properties
@@ -2038,6 +2044,10 @@ class ExpertCacheManager:
                 self.max_resident, self.local_num_experts,
                 self._scratch_capacity)
 
+        # ── Pre-build packed tail buffers for cutoff-boundary ──
+        if _CUTOFF_BOUNDARY and _CB_PACKED_TAIL and capacity > 0:
+            self._build_packed_tail_buffers()
+
         # Layer-concentrated shrink policy log
         n_eligible = len(self._shrink_eligible)
         if n_eligible < self.num_layers:
@@ -2469,6 +2479,61 @@ class ExpertCacheManager:
         # Each cutoff step evicts from (num_layers-1) layers
         return cutoff_steps * n_layers
 
+    def _build_packed_tail_buffers(self) -> None:
+        """Pre-pack tail experts [tail_base, localE) into contiguous pinned
+        buffers at init time.  Eliminates per-expert dict lookup and enables
+        single slice H2D copy in cutoff_prefetch_next().
+
+        Memory-neutral: packs tail range from cpu_pool into one contiguous
+        pinned buffer per layer, then deletes the individual pinned tensors.
+        One layer at a time to bound peak pinned overhead to 1 layer.
+
+        Must run AFTER _cutoff_verify_once() (which checks cpu_pool
+        completeness) — caller ensures this.
+        """
+        cap = self._scratch_capacity
+        localE = self.local_num_experts
+        tail_base = max(0, localE - cap)
+        self._cutoff_tail_base = tail_base
+
+        # Verify preconditions before deleting anything
+        if not self._cutoff_verify_once():
+            logger.warning(
+                "[CutoffBoundary] packed tail skipped: "
+                "verify failed, fallback to per-expert loop")
+            return
+
+        self._packed_w13 = [None] * self.num_layers
+        self._packed_w2 = [None] * self.num_layers
+
+        freed_count = 0
+        for li in range(1, self.num_layers):  # L0 always resident
+            # Allocate contiguous pinned buffer for this layer's tail
+            w13_buf = torch.empty(
+                (cap, *self._w13_shape), dtype=self.dtype).pin_memory()
+            w2_buf = torch.empty(
+                (cap, *self._w2_shape), dtype=self.dtype).pin_memory()
+
+            # Pack from individual pinned tensors
+            for i, lid in enumerate(range(tail_base, localE)):
+                w13_cpu, w2_cpu = self._cpu_pool[li][lid]
+                w13_buf[i].copy_(w13_cpu)
+                w2_buf[i].copy_(w2_cpu)
+            self._packed_w13[li] = w13_buf
+            self._packed_w2[li] = w2_buf
+
+            # Delete originals → pinned stays flat (1 layer overlap max)
+            for lid in range(tail_base, localE):
+                if lid in self._cpu_pool[li]:
+                    del self._cpu_pool[li][lid]
+                    freed_count += 1
+
+        self._packed_tail_active = True
+        logger.info(
+            "[CutoffBoundary] packed tail built: tail_base=%d cap=%d "
+            "layers=%d freed=%d pinned-neutral",
+            tail_base, cap, self.num_layers - 1, freed_count)
+
     def _cutoff_recompute_topology(self):
         """Deterministic tail from cutoff. Same for L1..L47."""
         cutoff = self._resident_cutoff
@@ -2559,30 +2624,60 @@ class ExpertCacheManager:
             f"{bank.state.name}")
         bank.state = _BankState.FILLING
         self._copy_stream.wait_event(bank.done_event)
+        n = len(tail)
         _split = self._tp_size <= 2
+
+        # Packed tail path: single contiguous slice copy (no dict lookup)
+        _packed = (self._packed_w13 is not None
+                   and self._packed_w13[next_idx] is not None
+                   and self._packed_w2 is not None
+                   and self._packed_w2[next_idx] is not None)
         with torch.cuda.stream(self._copy_stream):
-            if _split:
-                # w13 first → record w13_ready_event → w2 → record ready_event
-                # Allows w1 kernel to start while w2 is still copying.
-                for i, lid in enumerate(tail):
-                    w13_cpu, _ = self._cpu_pool[next_idx][lid]
-                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
-                if bank.w13_ready_event is not None:
-                    bank.w13_ready_event.record(self._copy_stream)
-                for i, lid in enumerate(tail):
-                    _, w2_cpu = self._cpu_pool[next_idx][lid]
-                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
+            if _packed:
+                off = self._resident_cutoff - self._cutoff_tail_base
+                assert 0 <= off and off + n <= self._scratch_capacity, (
+                    f"[CB] OOB: off={off} n={n} cap={self._scratch_capacity}")
+                if _split:
+                    bank.w13[:n].copy_(
+                        self._packed_w13[next_idx][off:off + n],
+                        non_blocking=True)
+                    if bank.w13_ready_event is not None:
+                        bank.w13_ready_event.record(self._copy_stream)
+                    bank.w2[:n].copy_(
+                        self._packed_w2[next_idx][off:off + n],
+                        non_blocking=True)
+                else:
+                    bank.w13[:n].copy_(
+                        self._packed_w13[next_idx][off:off + n],
+                        non_blocking=True)
+                    bank.w2[:n].copy_(
+                        self._packed_w2[next_idx][off:off + n],
+                        non_blocking=True)
             else:
-                for i, lid in enumerate(tail):
-                    w13_cpu, w2_cpu = self._cpu_pool[next_idx][lid]
-                    bank.w13[i].copy_(w13_cpu, non_blocking=True)
-                    bank.w2[i].copy_(w2_cpu, non_blocking=True)
+                # Fallback: per-expert loop (packed not built)
+                assert not self._packed_tail_active, (
+                    "[CB] packed tail active but fell to per-expert "
+                    "fallback — cpu_pool tail deleted, would KeyError")
+                if _split:
+                    for i, lid in enumerate(tail):
+                        w13_cpu, _ = self._cpu_pool[next_idx][lid]
+                        bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                    if bank.w13_ready_event is not None:
+                        bank.w13_ready_event.record(self._copy_stream)
+                    for i, lid in enumerate(tail):
+                        _, w2_cpu = self._cpu_pool[next_idx][lid]
+                        bank.w2[i].copy_(w2_cpu, non_blocking=True)
+                else:
+                    for i, lid in enumerate(tail):
+                        w13_cpu, w2_cpu = self._cpu_pool[next_idx][lid]
+                        bank.w13[i].copy_(w13_cpu, non_blocking=True)
+                        bank.w2[i].copy_(w2_cpu, non_blocking=True)
             bank.ready_event.record(self._copy_stream)
 
         bank.state = _BankState.READY
         bank.owner_layer_idx = next_idx
         bank.owner_layer = self._moe_layers[next_idx]
-        bank.n_active = len(tail)
+        bank.n_active = n
         self._cutoff_current_bank = target_bank
 
     def reserve_scratch(
