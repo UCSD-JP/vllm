@@ -1265,7 +1265,14 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens > 0
+                    if num_new_tokens <= 0:
+                        logger.warning(
+                            "Waiting request %s: num_new_tokens=%d <= 0 "
+                            "(computed=%d, num_tokens=%d) — skipping",
+                            request.request_id, num_new_tokens,
+                            num_computed_tokens, request.num_tokens,
+                        )
+                        break
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
