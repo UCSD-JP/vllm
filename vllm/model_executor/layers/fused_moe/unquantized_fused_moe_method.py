@@ -321,9 +321,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         _scratch_active = False
         _active_bank = None
         _active_bank_idx = -1
-        if _scratch_configured and getattr(_ec, '_scratch_banks', None):
+        _layer_idx = getattr(layer, '_expert_cache_layer_idx', -2)
+        # Cutoff: skip bank search for fully-resident layers
+        _skip_bank_search = (
+            _ec is not None
+            and getattr(_ec, '_cutoff_active', False)
+            and _layer_idx not in getattr(
+                _ec, '_cutoff_tail_layers', set()))
+        if (_scratch_configured
+                and getattr(_ec, '_scratch_banks', None)
+                and not _skip_bank_search):
             from .expert_cache import _BankState
-            _layer_idx = getattr(layer, '_expert_cache_layer_idx', -2)
             for _bi, _bk in enumerate(_ec._scratch_banks):
                 if (_bk.state == _BankState.READY
                         and _bk.owner_layer_idx == _layer_idx):
@@ -337,6 +345,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # Skip during CUDA graph capture (.item() is illegal).
             if (not _scratch_active and _ec._scratch_threshold > 0
                     and not torch.cuda.is_current_stream_capturing()
+                    and not getattr(_ec, '_dormant', True)
                     and not getattr(_ec, '_fixed_tail_active', False)
                     and not getattr(_ec, '_static_topo_active', False)
                     and not getattr(_ec, '_cutoff_active', False)):
@@ -414,8 +423,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             _ec.step_prefetch_next(
                 getattr(layer, '_expert_cache_layer_idx', -1))
         elif getattr(_ec, '_cutoff_active', False):
-            _ec.cutoff_prefetch_next(
-                getattr(layer, '_expert_cache_layer_idx', -1))
+            # Skip prefetch if next layer is fully resident
+            if (_layer_idx + 1) in getattr(
+                    _ec, '_cutoff_tail_layers', set()):
+                _ec.cutoff_prefetch_next(_layer_idx)
 
         # ── CacheMap -1 detection (VLLM_CORRUPTION_CHECK=1 only) ──
         # GPU sync via .item() — disabled by default for performance.

@@ -45,6 +45,7 @@ _FIXED_TAIL = os.environ.get("VLLM_FIXED_TAIL", "0") == "1"
 _STEP_BOUNDARY = os.environ.get("VLLM_STEP_BOUNDARY", "0") == "1"
 _CUTOFF_BOUNDARY = os.environ.get("VLLM_CUTOFF_BOUNDARY", "0") == "1"
 _CB_PACKED_TAIL = os.environ.get("VLLM_CB_PACKED_TAIL", "0") == "1"
+_CB_PER_LAYER = os.environ.get("VLLM_CB_TP4_OPTIMIZE", "0") == "1"
 
 # ── Eager breakdown accumulators (VLLM_EAGER_BREAKDOWN=1) ──
 if _EAGER_BREAKDOWN:
@@ -352,7 +353,12 @@ class ExpertCacheManager:
         self._cutoff_supported: bool = _CUTOFF_BOUNDARY  # env-based; cleared on verify fail
         self._cutoff_active: bool = False
         self._resident_cutoff: int = local_num_experts  # init: all resident
-        self._cutoff_tail_lids: List[int] = []  # shared across L1..L47
+        self._cutoff_tail_lids: List[int] = []  # shared across L1..L47 (OFF mode)
+        # Per-layer cutoff (ON mode: _CB_PER_LAYER)
+        self._resident_cutoff_per_layer: List[int] = [
+            local_num_experts] * num_layers
+        # Fast O(1) check: layers with tail (cutoff < localE)
+        self._cutoff_tail_layers: Set[int] = set()
         self._cutoff_current_bank: int = 0
         # Packed tail: contiguous pinned buffers for slice copy (built at init)
         self._packed_w13: Optional[List[Optional[torch.Tensor]]] = None
@@ -1110,11 +1116,25 @@ class ExpertCacheManager:
                 and len(self._scratch_banks) >= 2
                 and self._cutoff_verify_once()):
             if not self._cutoff_active:
-                if self._resident_cutoff < self.local_num_experts:
+                if _CB_PER_LAYER:
+                    _any_shrunk = any(
+                        c < self.local_num_experts
+                        for c in self._resident_cutoff_per_layer[1:])
+                else:
+                    _any_shrunk = (self._resident_cutoff
+                                   < self.local_num_experts)
+                if _any_shrunk:
                     self._cutoff_active = True
                     self._topology_dirty = True
-                    logger.info("[CutoffBoundary] ACTIVATING: cutoff=%d",
-                                self._resident_cutoff)
+                    if _CB_PER_LAYER:
+                        _min_c = min(self._resident_cutoff_per_layer[1:])
+                        logger.info(
+                            "[CutoffBoundary] ACTIVATING: "
+                            "per-layer min_cutoff=%d", _min_c)
+                    else:
+                        logger.info(
+                            "[CutoffBoundary] ACTIVATING: cutoff=%d",
+                            self._resident_cutoff)
 
             if self._cutoff_active:
                 if self._topology_dirty:
@@ -2406,11 +2426,15 @@ class ExpertCacheManager:
     # ================================================================
 
     def _cutoff_shrink(self, min_pages: int) -> Tuple[int, int]:
-        """Suffix-cut shrink: evict highest-lid experts, L1..L47 uniform.
+        """Suffix-cut shrink: evict highest-lid experts.
 
-        L0 excluded (always resident-only). L1..L47 evict same lids.
-        _shrink_eligible ignored — cutoff mode uses its own policy.
+        _CB_PER_LAYER ON  → per-layer sequential (L1 floor → L2 → ...)
+        _CB_PER_LAYER OFF → uniform L1..L47 (original behavior)
         """
+        if _CB_PER_LAYER:
+            return self._cutoff_shrink_per_layer(min_pages)
+
+        # ── OFF: uniform cutoff (original) ──
         pool = self._vmm_pool
         if not pool:
             return 0, 0
@@ -2448,6 +2472,9 @@ class ExpertCacheManager:
         self._resident_cutoff = new_cutoff
         self._topology_dirty = True
         self._cache_map_needs_rebuild = True
+        # Uniform: all L1..L47 share same tail
+        if new_cutoff < self.local_num_experts:
+            self._cutoff_tail_layers = set(range(1, self.num_layers))
 
         logger.info(
             "[CutoffBoundary] shrink: cutoff %d→%d, freed %d pages, "
@@ -2456,27 +2483,98 @@ class ExpertCacheManager:
             n_layers, floor, self._scratch_capacity)
         return freed_pages, groups_evicted
 
+    def _cutoff_shrink_per_layer(self, min_pages: int) -> Tuple[int, int]:
+        """Per-layer sequential eviction: exhaust L1 to floor, then L2, ...
+
+        Each group = group_size experts × 1 layer → ~group_pages freed.
+        Stops as soon as total_freed >= min_pages.
+        """
+        pool = self._vmm_pool
+        if not pool:
+            return 0, 0
+        gs = pool.group_size
+        floor = max(0, self.local_num_experts - self._scratch_capacity)
+
+        all_victims: List[Tuple[int, int]] = []
+        total_freed = 0
+
+        for li in range(1, self.num_layers):
+            cutoff_i = self._resident_cutoff_per_layer[li]
+
+            while cutoff_i > floor and total_freed < min_pages:
+                new_cutoff_i = max(floor, cutoff_i - gs)
+                group_victims = []
+                for lid in range(new_cutoff_i, cutoff_i):
+                    slot = self._expert_to_slot[li][lid]
+                    if slot >= 0:
+                        group_victims.append((li, slot))
+
+                if not group_victims:
+                    cutoff_i = new_cutoff_i
+                    continue
+
+                freed = pool.unmap_expert_slots(group_victims)
+                total_freed += freed
+                all_victims.extend(group_victims)
+                cutoff_i = new_cutoff_i
+
+            self._resident_cutoff_per_layer[li] = cutoff_i
+            if total_freed >= min_pages:
+                break
+
+        if not all_victims:
+            return 0, 0
+
+        groups_evicted = self._update_tracking_after_evict(all_victims)
+        self._topology_dirty = True
+        self._cache_map_needs_rebuild = True
+
+        # Sync scalar for backward compat (min of L1..L47)
+        self._resident_cutoff = min(
+            self._resident_cutoff_per_layer[1:])
+
+        # Update fast tail-layer set
+        localE = self.local_num_experts
+        self._cutoff_tail_layers = set(
+            li for li in range(1, self.num_layers)
+            if self._resident_cutoff_per_layer[li] < localE)
+
+        affected = sorted(set(li for li, _ in all_victims))
+        logger.info(
+            "[CutoffBoundary] per-layer shrink: freed %d pages, "
+            "%d groups, layers=%s",
+            total_freed, groups_evicted, affected)
+        return total_freed, groups_evicted
+
     def _cutoff_count_evictable_groups(self) -> int:
         """Count evictable groups under cutoff policy (prepare-safe).
 
         Must match _cutoff_shrink logic so prepare never over-promises.
         Returns total per-layer group evictions (not cutoff steps), so
         worker's `groups * group_pages` formula gives correct page count.
-
-        One cutoff step = (num_layers-1) per-layer group evictions.
         """
         pool = self._vmm_pool
         if not pool:
             return 0
         gs = pool.group_size
-        n_layers = self.num_layers - 1  # L0 excluded
-        if n_layers <= 0:
+        if self.num_layers <= 1:
             return 0
-        cutoff = self._resident_cutoff
         floor = max(0, self.local_num_experts - self._scratch_capacity)
+
+        if _CB_PER_LAYER:
+            # Per-layer: each layer independently contributes groups
+            total = 0
+            for li in range(1, self.num_layers):
+                evictable = max(
+                    0, self._resident_cutoff_per_layer[li] - floor)
+                total += evictable // gs
+            return total
+
+        # OFF: uniform cutoff — one step evicts from all layers
+        n_layers = self.num_layers - 1
+        cutoff = self._resident_cutoff
         evictable_lids = max(0, cutoff - floor)
         cutoff_steps = evictable_lids // gs
-        # Each cutoff step evicts from (num_layers-1) layers
         return cutoff_steps * n_layers
 
     def _build_packed_tail_buffers(self) -> None:
@@ -2535,29 +2633,42 @@ class ExpertCacheManager:
             tail_base, cap, self.num_layers - 1, freed_count)
 
     def _cutoff_recompute_topology(self):
-        """Deterministic tail from cutoff. Same for L1..L47."""
-        cutoff = self._resident_cutoff
+        """Deterministic tail from cutoff."""
         localE = self.local_num_experts
 
-        self._cutoff_tail_lids = list(range(cutoff, localE))
-        n_tail = len(self._cutoff_tail_lids)
-
-        assert n_tail <= self._scratch_capacity, (
-            f"[CutoffBoundary] tail={n_tail} > scratch="
-            f"{self._scratch_capacity}")
-        # Pinned/cpu_pool already verified at latch time (pre_step)
-
-        logger.info("[CutoffBoundary] topology: cutoff=%d tail=%d scratch=%d",
-                    cutoff, n_tail, self._scratch_capacity)
+        if _CB_PER_LAYER:
+            tails = {}
+            for li in range(1, self.num_layers):
+                n = localE - self._resident_cutoff_per_layer[li]
+                if n > 0:
+                    tails[li] = n
+            max_tail = max(tails.values()) if tails else 0
+            assert max_tail <= self._scratch_capacity, (
+                f"[CutoffBoundary] max_tail={max_tail} > scratch="
+                f"{self._scratch_capacity}")
+            logger.info(
+                "[CutoffBoundary] topology: %d layers with tail, "
+                "max_tail=%d, scratch=%d",
+                len(tails), max_tail, self._scratch_capacity)
+        else:
+            cutoff = self._resident_cutoff
+            self._cutoff_tail_lids = list(range(cutoff, localE))
+            n_tail = len(self._cutoff_tail_lids)
+            assert n_tail <= self._scratch_capacity, (
+                f"[CutoffBoundary] tail={n_tail} > scratch="
+                f"{self._scratch_capacity}")
+            logger.info(
+                "[CutoffBoundary] topology: cutoff=%d tail=%d scratch=%d",
+                cutoff, n_tail, self._scratch_capacity)
 
     def _cutoff_rebuild_cache_maps(self):
         """One-time full cache_map rebuild from cutoff.
 
         L0: always resident-only (all experts → slot = lid).
-        L1..L47: lids [0, cutoff) → resident slot,
-                 lids [cutoff, localE) → scratch slot.
+        L1..L47: lids [0, cutoff_i) → resident slot,
+                 lids [cutoff_i, localE) → scratch slot.
+        Per-layer cutoff when _CB_PER_LAYER, else uniform.
         """
-        cutoff = self._resident_cutoff
         threshold = self._scratch_threshold
         emap_np_list = getattr(self, '_emap_cpu_np', None)
 
@@ -2566,18 +2677,20 @@ class ExpertCacheManager:
                 (self.global_num_experts,), -1, dtype=torch.int32)
             emap_np = emap_np_list[li] if emap_np_list else None
             is_l0 = (li == 0)
+            cutoff_i = (self._resident_cutoff_per_layer[li]
+                        if _CB_PER_LAYER else self._resident_cutoff)
 
             if emap_np is not None:
                 for gid in range(len(emap_np)):
                     lid = int(emap_np[gid])
                     if lid < 0:
                         continue
-                    if is_l0 or lid < cutoff:
+                    if is_l0 or lid < cutoff_i:
                         slot = self._expert_to_slot[li][lid]
                         if slot >= 0:
                             cache_map[gid] = slot
                     else:
-                        cache_map[gid] = threshold + (lid - cutoff)
+                        cache_map[gid] = threshold + (lid - cutoff_i)
             else:
                 if is_l0:
                     for lid in range(self.local_num_experts):
@@ -2585,12 +2698,12 @@ class ExpertCacheManager:
                         if slot >= 0:
                             cache_map[lid] = slot
                 else:
-                    for lid in range(cutoff):
+                    for lid in range(cutoff_i):
                         slot = self._expert_to_slot[li][lid]
                         if slot >= 0:
                             cache_map[lid] = slot
                     for i, lid in enumerate(
-                            range(cutoff, self.local_num_experts)):
+                            range(cutoff_i, self.local_num_experts)):
                         cache_map[lid] = threshold + i
 
             self._moe_layers[li]._cache_map.copy_(
@@ -2604,13 +2717,26 @@ class ExpertCacheManager:
         Called from every layer's forward (including L0 which has no scratch).
         L0→L1: first bank fill (bank[0]).
         L1→L2, ...: alternating banks.
+
+        _CB_PER_LAYER ON : per-layer cutoff, packed-only (no fallback).
+        _CB_PER_LAYER OFF: uniform cutoff, packed + fallback.
         """
         next_idx = layer_idx + 1
         if next_idx >= self.num_layers:
             return
-        tail = self._cutoff_tail_lids
-        if not tail:
-            return
+
+        # ── Determine tail size ──
+        if _CB_PER_LAYER:
+            cutoff_next = self._resident_cutoff_per_layer[next_idx]
+            localE = self.local_num_experts
+            n = localE - cutoff_next
+            if n <= 0:
+                return  # fully resident → no prefetch
+        else:
+            tail = self._cutoff_tail_lids
+            if not tail:
+                return
+            n = len(tail)
 
         # First call (from L0): use bank 0. Otherwise alternate.
         if layer_idx == 0:
@@ -2624,7 +2750,6 @@ class ExpertCacheManager:
             f"{bank.state.name}")
         bank.state = _BankState.FILLING
         self._copy_stream.wait_event(bank.done_event)
-        n = len(tail)
         _split = self._tp_size <= 2
 
         # Packed tail path: single contiguous slice copy (no dict lookup)
@@ -2634,9 +2759,14 @@ class ExpertCacheManager:
                    and self._packed_w2[next_idx] is not None)
         with torch.cuda.stream(self._copy_stream):
             if _packed:
-                off = self._resident_cutoff - self._cutoff_tail_base
+                if _CB_PER_LAYER:
+                    off = cutoff_next - self._cutoff_tail_base
+                else:
+                    off = self._resident_cutoff - self._cutoff_tail_base
                 assert 0 <= off and off + n <= self._scratch_capacity, (
                     f"[CB] OOB: off={off} n={n} cap={self._scratch_capacity}")
+                assert n <= bank.w13.shape[0], (
+                    f"[CB] n={n} > bank_capacity={bank.w13.shape[0]}")
                 if _split:
                     bank.w13[:n].copy_(
                         self._packed_w13[next_idx][off:off + n],
@@ -2655,6 +2785,8 @@ class ExpertCacheManager:
                         non_blocking=True)
             else:
                 # Fallback: per-expert loop (packed not built)
+                assert not _CB_PER_LAYER, (
+                    "[CB] per-layer cutoff requires packed tail buffers")
                 assert not self._packed_tail_active, (
                     "[CB] packed tail active but fell to per-expert "
                     "fallback — cpu_pool tail deleted, would KeyError")

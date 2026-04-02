@@ -3304,6 +3304,39 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        # ── Torch profiler (VLLM_TORCH_PROFILE=1) ──
+        _tp_enabled = os.environ.get("VLLM_TORCH_PROFILE", "0") == "1"
+        if _tp_enabled:
+            if not hasattr(self, '_tp_step'):
+                self._tp_step = 0
+                self._tp_profiler = None
+            s = self._tp_step
+            start = int(os.environ.get("VLLM_TORCH_PROFILE_START", "5"))
+            n_steps = int(os.environ.get("VLLM_TORCH_PROFILE_STEPS", "3"))
+            out_dir = os.environ.get(
+                "VLLM_TORCH_PROFILE_DIR", "/tmp/vllm_trace")
+            end = start + n_steps
+            if s == start:
+                os.makedirs(out_dir, exist_ok=True)
+                self._tp_profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    with_stack=False,
+                    record_shapes=True,
+                )
+                self._tp_profiler.__enter__()
+                logger.info("[TorchProfile] started at step %d", s)
+            if s == end and self._tp_profiler is not None:
+                self._tp_profiler.__exit__(None, None, None)
+                trace_path = os.path.join(out_dir, "trace.json")
+                self._tp_profiler.export_chrome_trace(trace_path)
+                logger.info("[TorchProfile] saved %s (%d steps)",
+                            trace_path, n_steps)
+                self._tp_profiler = None
+            self._tp_step = s + 1
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
