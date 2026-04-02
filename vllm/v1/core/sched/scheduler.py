@@ -993,7 +993,7 @@ class Scheduler(SchedulerInterface):
                     request, num_new_tokens
                 )
 
-            if num_new_tokens == 0:
+            if num_new_tokens <= 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
                 # 1. No new tokens to schedule. This may happen when
@@ -1005,9 +1005,21 @@ class Scheduler(SchedulerInterface):
                 # 3. The encoder cache is exhausted.
                 # 4. Insufficient budget for a block-aligned chunk in hybrid
                 #    models with mamba cache mode \"align\".
+                # 5. num_computed_tokens exceeded num_tokens_with_spec
+                #    (can occur after elastic KV shrink/expand cycles).
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
+                if num_new_tokens < 0:
+                    logger.warning(
+                        "Running request %s: num_new_tokens=%d < 0 "
+                        "(computed=%d, tokens_with_spec=%d, placeholders=%d)"
+                        " — skipping this step",
+                        request.request_id, num_new_tokens,
+                        request.num_computed_tokens,
+                        request.num_tokens_with_spec,
+                        request.num_output_placeholders,
+                    )
                 req_index += 1
                 continue
 
@@ -1554,6 +1566,12 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        # Async scheduling: discard pending placeholders to prevent
+        # num_output_placeholders going negative when the in-flight
+        # output arrives after preemption.
+        if request.num_output_placeholders > 0:
+            request.num_output_placeholders = 0
+            request.discard_latest_async_tokens = True
         request.spec_token_ids.clear()
         request.num_preemptions += 1
         if self.log_stats:
