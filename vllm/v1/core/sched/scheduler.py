@@ -1272,7 +1272,9 @@ class Scheduler(SchedulerInterface):
                             request.request_id, num_new_tokens,
                             num_computed_tokens, request.num_tokens,
                         )
-                        break
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
