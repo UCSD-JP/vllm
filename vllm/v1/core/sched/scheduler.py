@@ -1572,15 +1572,14 @@ class Scheduler(SchedulerInterface):
         if request.num_output_placeholders > 0:
             request.num_output_placeholders = 0
             request.discard_latest_async_tokens = True
-        # Remove from prev-step tracking so that the request is treated
-        # as "resumed" (not "still running") when re-scheduled.
-        self.prev_step_scheduled_req_ids.discard(request.request_id)
         request.spec_token_ids.clear()
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
         # Record preempt timestamp for queue delay EMA
         self._preempt_timestamps[request.request_id] = time.monotonic()
+        # Remove from prev_step tracking so re-schedule sees it as new.
+        self.prev_step_scheduled_req_ids.discard(request.request_id)
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)

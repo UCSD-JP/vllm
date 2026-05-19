@@ -3103,11 +3103,18 @@ class GPUModelRunner(
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, use_cascade_attn or has_encoder_output
         )
-        # Dual CUDA graph: set offload_active when experts are actually
-        # evicted. Clean graph is used when all experts are resident.
+        # Expert offload requires live Python for bank rotation, H2D
+        # prefetch, and cache_map updates — incompatible with CUDA graphs.
+        # Fall back to eager (NONE) when experts are evicted.
         if (hasattr(self, '_expert_cache')
                 and self._expert_cache is not None
                 and self._expert_cache.has_evicted_experts()):
+            if cudagraph_mode != CUDAGraphMode.NONE:
+                cudagraph_mode = CUDAGraphMode.NONE
+                batch_descriptor = BatchDescriptor(num_tokens_padded)
+                logger.info_once(
+                    "Expert offload active: cudagraph→NONE "
+                    "for scratch bank rotation compatibility")
             batch_descriptor = batch_descriptor._replace(
                 offload_active=True)
         num_tokens_padded = batch_descriptor.num_tokens
@@ -3151,16 +3158,22 @@ class GPUModelRunner(
                 dp_rank = self.parallel_config.data_parallel_rank
                 num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
                 # Re-dispatch with DP padding so we have the correct batch_descriptor
-                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                    num_tokens_padded,
-                    disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
+                _offload_active = (
+                    hasattr(self, '_expert_cache')
+                    and self._expert_cache is not None
+                    and self._expert_cache.has_evicted_experts()
                 )
-                # Dual CUDA graph: re-apply offload_active after DP re-dispatch
-                if (hasattr(self, '_expert_cache')
-                        and self._expert_cache is not None
-                        and self._expert_cache.has_evicted_experts()):
+                if _offload_active:
+                    cudagraph_mode = CUDAGraphMode.NONE
+                    batch_descriptor = BatchDescriptor(num_tokens_padded)
                     batch_descriptor = batch_descriptor._replace(
                         offload_active=True)
+                else:
+                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                        num_tokens_padded,
+                        disable_full=synced_cudagraph_mode
+                        <= CUDAGraphMode.PIECEWISE.value,
+                    )
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
@@ -3303,39 +3316,6 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
-
-        # ── Torch profiler (VLLM_TORCH_PROFILE=1) ──
-        _tp_enabled = os.environ.get("VLLM_TORCH_PROFILE", "0") == "1"
-        if _tp_enabled:
-            if not hasattr(self, '_tp_step'):
-                self._tp_step = 0
-                self._tp_profiler = None
-            s = self._tp_step
-            start = int(os.environ.get("VLLM_TORCH_PROFILE_START", "5"))
-            n_steps = int(os.environ.get("VLLM_TORCH_PROFILE_STEPS", "3"))
-            out_dir = os.environ.get(
-                "VLLM_TORCH_PROFILE_DIR", "/tmp/vllm_trace")
-            end = start + n_steps
-            if s == start:
-                os.makedirs(out_dir, exist_ok=True)
-                self._tp_profiler = torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    with_stack=False,
-                    record_shapes=True,
-                )
-                self._tp_profiler.__enter__()
-                logger.info("[TorchProfile] started at step %d", s)
-            if s == end and self._tp_profiler is not None:
-                self._tp_profiler.__exit__(None, None, None)
-                trace_path = os.path.join(out_dir, "trace.json")
-                self._tp_profiler.export_chrome_trace(trace_path)
-                logger.info("[TorchProfile] saved %s (%d steps)",
-                            trace_path, n_steps)
-                self._tp_profiler = None
-            self._tp_step = s + 1
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()

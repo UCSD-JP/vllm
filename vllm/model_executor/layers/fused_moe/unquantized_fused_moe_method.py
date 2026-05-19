@@ -345,7 +345,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # Skip during CUDA graph capture (.item() is illegal).
             if (not _scratch_active and _ec._scratch_threshold > 0
                     and not torch.cuda.is_current_stream_capturing()
-                    and not getattr(_ec, '_dormant', True)
                     and not getattr(_ec, '_fixed_tail_active', False)
                     and not getattr(_ec, '_static_topo_active', False)
                     and not getattr(_ec, '_cutoff_active', False)):

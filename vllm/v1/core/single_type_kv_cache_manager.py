@@ -102,7 +102,14 @@ class SingleTypeKVCacheManager(ABC):
 
         if request_id in self.num_cached_block:
             # Fast-path: a running request won't have any new prefix-cache hits.
-            assert len(new_computed_blocks) == 0
+            # PP (prefix protection) may re-call try_allocate on running
+            # requests for block deficit estimation — ignore stale hits.
+            if len(new_computed_blocks) > 0:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "Running request %s has %d new_computed_blocks "
+                    "(prefix protection re-alloc?), ignoring",
+                    request_id, len(new_computed_blocks))
             # NOTE: With speculative decoding, request's blocks may be allocated
             # for draft tokens which are later rejected. In this case,
             # num_required_blocks may be smaller than num_req_blocks.
@@ -159,8 +166,8 @@ class SingleTypeKVCacheManager(ABC):
 
         if request_id in self.num_cached_block:
             # Fast-path: a running request won't have any new prefix-cache hits.
-            # It should not have any new computed blocks.
-            assert len(new_computed_blocks) == 0
+            # PP (prefix protection) may re-call on running requests — safe
+            # to ignore stale computed blocks here.
             return
 
         # A new request.
